@@ -33,9 +33,9 @@ def main(args):
         model.extract_features = True
 
     if(os.path.splitext(args.csv)[1] == ".csv"):        
-        df_test = pd.read_csv(os.path.join(args.mount_point, args.csv))
+        df_test = pd.read_csv(args.csv)
     else:        
-        df_test = pd.read_parquet(os.path.join(args.mount_point, args.csv))
+        df_test = pd.read_parquet(args.csv)
 
     use_class_column = False
     if args.class_column is not None and args.class_column in df_test.columns:
@@ -52,10 +52,10 @@ def main(args):
 
         #df_test[args.class_column] = df_test[args.class_column].replace(class_replace)
 
-        test_ds = USDataset(df_test, img_column=args.img_column, class_column=args.class_column, transform=USClassEvalTransforms())    
+        test_ds = USDataset(df_test, img_column=args.img_column, class_column=args.class_column, mount_point=args.mount_point, transform=USClassEvalTransforms())    
     else:
 
-        test_ds = USDataset(df_test, img_column=args.img_column, transform=USClassEvalTransforms())
+        test_ds = USDataset(df_test, img_column=args.img_column, mount_point=args.mount_point, transform=USClassEvalTransforms())
 
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, prefetch_factor=4)
 
@@ -125,7 +125,7 @@ if __name__ == '__main__':
     parser.add_argument('--pred_column', help='Output column name', type=str, default="pred_class")
     parser.add_argument('--mount_point', help='Dataset mount directory', type=str, default="./")
     parser.add_argument('--num_workers', help='Number of workers for loading', type=int, default=4)
-    parser.add_argument('--batch_size', help='Batch size', type=int, default=256)
+    parser.add_argument('--batch_size', help='Batch size', type=int, default=128)
     parser.add_argument('--nn', help='Type of neural network', type=str, default="efficientnet_b0")
 
     args = parser.parse_args()

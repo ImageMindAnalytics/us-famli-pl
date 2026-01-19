@@ -1,4 +1,4 @@
-from pytorch_lightning.callbacks import Callback
+from lightning.pytorch.callbacks import Callback
 import torchvision
 import torch
 
@@ -182,6 +182,30 @@ class BlindSweepImageLogger(Callback):
             # grid_img1 = torchvision.utils.make_grid(img[0,:,:,:])
             # trainer.logger.experiment.add_image('img1', grid_img1.cpu().numpy(), 0)
 
+class ClassificationImageLogger(Callback):
+    def __init__(self, num_images=16, log_steps=50):
+        self.log_steps = log_steps
+        self.num_images = num_images
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
+        
+        if batch_idx % self.log_steps == 0:
+            with torch.no_grad():
+
+                if isinstance(batch, dict):
+                    X = batch["img"]                    
+                else:
+                    X, Y = batch                
+
+                max_num_image = min(X.shape[0], self.num_images)
+
+                X = (X - X.min())/(X.max() - X.min())
+
+                grid_img1 = torchvision.utils.make_grid(X[0:max_num_image])
+
+                fig = plt.figure(figsize=(7, 9))
+                ax = plt.imshow(grid_img1.permute(1, 2, 0).cpu().numpy())
+                trainer.logger.experiment["images/x"].upload(fig)
+                plt.close()
 
 class DiffusionImageLogger(Callback):
     def __init__(self, num_images=16, log_steps=100):
@@ -263,20 +287,29 @@ class DiffusionImageLoggerNeptune(Callback):
                     z_vae = z_vae.clip(0,1)
                     z_mu = z_mu.clip(0, 1)
 
-                    grid_x_z_mu = torchvision.utils.make_grid(z_mu[0:max_num_image])
+                    grid_x_z_mu = torchvision.utils.make_grid(z_mu[0:max_num_image,0:3])
 
                     fig = plt.figure(figsize=(7, 9))
                     ax = plt.imshow(grid_x_z_mu.permute(1, 2, 0).cpu().numpy())
                     trainer.logger.experiment["images/z_mu"].upload(fig)
                     plt.close()
 
-                    grid_x_z_vae = torchvision.utils.make_grid(z_vae[0:max_num_image])
+                    grid_x_z_vae = torchvision.utils.make_grid(z_vae[0:max_num_image,0:3])
 
                     fig = plt.figure(figsize=(7, 9))
                     ax = plt.imshow(grid_x_z_vae.permute(1, 2, 0).cpu().numpy())
                     trainer.logger.experiment["images/z_vae"].upload(fig)
                     plt.close()
-                
+
+                if hasattr(pl_module, 'encoder'):
+                    h = pl_module.encoder(x)                    
+                    h = (h - torch.min(h))/(torch.max(h) - torch.min(h))
+                    grid_h = torchvision.utils.make_grid(h[0:max_num_image,0:3])
+
+                    fig = plt.figure(figsize=(7, 9))
+                    ax = plt.imshow(grid_h.permute(1, 2, 0).cpu().numpy())
+                    trainer.logger.experiment["images/h"].upload(fig)
+                    plt.close()
 
 
 class DiffusionImageLoggerPairedNeptune(Callback):
