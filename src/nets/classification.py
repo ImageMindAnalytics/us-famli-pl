@@ -490,7 +490,7 @@ class RegEffnetV2s(LightningModule):
         encoder = torchvision.models.efficientnet_v2_s(weights='IMAGENET1K_V1')
         encoder.classifier = nn.Identity()
 
-        self.encoder = TimeDistributed(encoder)
+        self.encoder = encoder
 
         self.proj = nn.Linear(self.hparams.features, 1)
         self.act = nn.Sigmoid()
@@ -505,7 +505,9 @@ class RegEffnetV2s(LightningModule):
             ]
         )
 
-        self.loss_fn = nn.L1Loss(reduction='sum')
+        # self.loss_fn = nn.L1Loss(reduction='sum')
+        self.loss_fn = nn.HuberLoss(delta=5.0, reduction='sum')
+        self.l1_loss = nn.L1Loss()
 
         self.mae = MeanAbsoluteError()
         self.mse = MeanSquaredError()
@@ -520,7 +522,7 @@ class RegEffnetV2s(LightningModule):
 
         group.add_argument("--lr", type=float, default=1e-3)
         group.add_argument("--betas", type=float, nargs="+", default=(0.9, 0.999), help='Betas for Adam optimizer')
-        group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=0.01)
+        group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=1e-2)
         
         # Image Encoder parameters 
         group.add_argument("--spatial_dims", type=int, default=2, help='Spatial dimensions for the encoder')
@@ -549,6 +551,9 @@ class RegEffnetV2s(LightningModule):
         loss = (self.loss_fn(X_hat, Y.float())*((Y*8.0)*(Y>=0.75) + 1.0)).sum()
         self.log(f"{step}_loss", loss, sync_dist=sync_dist)
 
+        l1 = self.l1_loss(X_hat, Y.float())
+        self.log(f"{step}_l1", l1, sync_dist=sync_dist)
+
         self.mae(X_hat, Y)
         self.mse(X_hat, Y)
 
@@ -559,9 +564,7 @@ class RegEffnetV2s(LightningModule):
 
     def training_step(self, train_batch, batch_idx):
         X = train_batch["img"]
-        Y = train_batch["class"]
-
-        X = X.permute(0, 2, 1, 3, 4)  # (B, T, C, H, W) -> (B, C, T, H, W)
+        Y = train_batch["scalar"]
 
         x_hat = self(self.train_transform(X))
 
@@ -570,9 +573,7 @@ class RegEffnetV2s(LightningModule):
     def validation_step(self, val_batch, batch_idx):
         
         X = val_batch["img"]
-        Y = val_batch["class"]
-
-        X = X.permute(0, 2, 1, 3, 4)
+        Y = val_batch["scalar"]
 
         x_hat = self(X)
 
@@ -631,11 +632,11 @@ class RegEffnetV2s(LightningModule):
 
     def test_step(self, test_batch, batch_idx):
         X = test_batch["img"]
-        Y = test_batch["class"]
-
-        X = X.permute(0, 2, 1, 3, 4)
+        Y = test_batch["scalar"]
 
         x_hat = self(X)
+
+        self.compute_loss(Y=Y, X_hat=x_hat, step="test", sync_dist=True)
         
         self.preds.update(x_hat.view(-1))
         self.targets.update(Y.view(-1))
