@@ -27,7 +27,7 @@ def main(args):
     if(args.nn is not None):
         NN = getattr(classification, args.nn)    
     else:
-        NN = classification.EfficientNetClassification
+        NN = classification.EfficientNet
     model = NN.load_from_checkpoint(args.model)
     model.eval()
     model.cuda()
@@ -124,8 +124,7 @@ if __name__ == '__main__':
     parser.add_argument('--extract_features', type=int, help='Extract the features', default=0)
     parser.add_argument('--img_column', type=str, help='Column name in the csv file with image path', default="uuid_path")
     parser.add_argument('--repeat_channel', type=int, help='Repeat last channel to have 3 components', default=0)
-    parser.add_argument('--class_column', type=str, help='Column name in the csv file with classes', default=None)
-    parser.add_argument('--lr', '--learning-rate', default=1e-4, type=float, help='Learning rate')
+    parser.add_argument('--class_column', type=str, help='Column name in the csv file with classes', default=None)    
     parser.add_argument('--nn', help='Type of NN', type=str, default=None)
     parser.add_argument('--model', help='Model path to continue training', type=str, default=None)
     parser.add_argument('--epochs', help='Max number of epochs', type=int, default=200)    

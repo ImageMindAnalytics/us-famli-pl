@@ -80,7 +80,8 @@ def main(args):
         accelerator='gpu', 
         devices=torch.cuda.device_count(),
         strategy=DDPStrategy(find_unused_parameters=args.find_unused_parameters),
-        deterministic=deterministic
+        deterministic=deterministic,
+        accumulate_grad_batches=args.accumulate_grad_batches,
         # strategy=DDPStrategy(),
     )
     
@@ -99,6 +100,7 @@ if __name__ == '__main__':
     hparams_group.add_argument('--steps', help='Max number of steps per epoch', type=int, default=-1)    
     hparams_group.add_argument('--seed_everything', help='Seed everything for training', type=int, default=None)
     hparams_group.add_argument('--find_unused_parameters', help='find_unused_parameters', type=int, default=0)
+    hparams_group.add_argument('--accumulate_grad_batches', help='Accumulate gradient batches', type=int, default=1)
 
     input_group = parser.add_argument_group('Input')
     

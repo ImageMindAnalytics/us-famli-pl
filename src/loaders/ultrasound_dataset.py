@@ -1001,7 +1001,7 @@ class USDataModuleBlindSweepWTag(LightningDataModule):
 
 
 class USAnnotatedBlindSweep(Dataset):
-    def __init__(self, df, mount_point = "./", img_column='file_path', tag_column='tag', frame_column="frame_index", frame_label="annotation_label", id_column='annotation_id', num_frames=64, transform=None, frame_label_dict=None, sample_balanced=False):
+    def __init__(self, df, mount_point = "./", img_column='file_path', tag_column='tag', frame_column="frame_index", id_column='annotation_id', num_frames=64, transform=None, frame_label=None, frame_label_dict=None, scalar_label=None, scalar_label_dict=None, sample_balanced=False):
         
         self.df_frames = df        
         self.mount_point = mount_point
@@ -1010,7 +1010,10 @@ class USAnnotatedBlindSweep(Dataset):
         self.id_column = id_column
         self.tag_column = tag_column        
         self.frame_column = frame_column
-        self.frame_label = frame_label        
+        self.frame_label = frame_label     
+        self.frame_label_dict = frame_label_dict   
+        self.scalar_label = scalar_label
+        self.scalar_label_dict = scalar_label_dict
         self.transform = transform
         self.sample_balanced = sample_balanced
 
@@ -1021,16 +1024,6 @@ class USAnnotatedBlindSweep(Dataset):
         self.tags_dict = TAGS_DICT
 
         self.max_tag = np.max(list(self.tags_dict.values())) + 1
-
-        if frame_label_dict:
-            self.frame_label_dict = frame_label_dict
-        else:
-            self.frame_label_dict = {
-                'low_visible': 1,
-                'high_visible': 2,
-                'low_measurable': 3,
-                'high_measurable': 4
-            }
 
     def __len__(self):
         return len(self.keys)
@@ -1046,7 +1039,11 @@ class USAnnotatedBlindSweep(Dataset):
         if sweep_tag == -1:            
             sweep_tag = torch.randint(low=0, high=self.max_tag, size=(1,)).item()
 
+        ret_d = {}
+
         sweep_tag_t = torch.tensor(sweep_tag, dtype=torch.int64)
+
+        ret_d["sweep_tag"] = sweep_tag_t
 
         try:
             img = sitk.ReadImage(img_path)
@@ -1060,61 +1057,94 @@ class USAnnotatedBlindSweep(Dataset):
             frame_idx = frames[self.frame_column].values.tolist()
             frame_idx = np.clip(frame_idx, 0, img_t.shape[0]-1)
 
-            frame_labels = frames[self.frame_label].values.tolist()
-            frame_labels_idx = [self.frame_label_dict[lbl] for lbl in frame_labels]
+            if self.frame_label is not None:
 
-            img_labels_t = torch.zeros(img_t.shape[0], dtype=torch.float32)
-            img_labels_t[frame_idx] = torch.tensor(frame_labels_idx, dtype=torch.float32)
+                frame_labels = frames[self.frame_label].values.tolist()
+                frame_labels_idx = [self.frame_label_dict[lbl] for lbl in frame_labels]
+
+                img_labels_t = torch.zeros(img_t.shape[0], dtype=torch.float32)
+                img_labels_t[frame_idx] = torch.tensor(frame_labels_idx, dtype=torch.float32)
+                
+                ret_d["class"] = img_labels_t
+            
+            if self.scalar_label is not None:
+                
+                scalar_labels = frames[self.scalar_label].values.tolist()
+                scalar_labels_idx = [self.scalar_label_dict[lbl] for lbl in scalar_labels]
+
+                img_scalar_t = torch.zeros(img_t.shape[0], dtype=torch.float32)
+                img_scalar_t[frame_idx] = torch.tensor(scalar_labels_idx, dtype=torch.float32)
+                
+                ret_d["scalar"] = img_scalar_t
 
             if self.num_frames > 0:
                 if self.sample_balanced:
-                    labels = img_labels_t
-                    unique_values = labels.unique()
-                    label_to_indices = {val.item(): (labels == val).nonzero(as_tuple=True)[0] for val in unique_values}
-
-                    n_samples_per_class = self.num_frames // len(unique_values)
                     balanced_indices = []
-                    for val in unique_values:
-                        indices = label_to_indices[val.item()]
-                        if len(indices) >= n_samples_per_class:
-                            sampled_indices = torch.randperm(len(indices))[:n_samples_per_class]
-                            balanced_indices.extend(indices[sampled_indices].tolist())
-                        else:
-                            sampled_indices = torch.randint(low=0, high=len(indices), size=(n_samples_per_class,))
-                            balanced_indices.extend(indices[sampled_indices].tolist())
 
-                    if len(balanced_indices) < self.num_frames:
-                        additional_indices = torch.randint(low=0, high=img_t.shape[0], size=(self.num_frames - len(balanced_indices),))
-                        balanced_indices.extend(additional_indices.tolist())
+                    if("class" in ret_d):
                         
-                    balanced_indices = torch.tensor(balanced_indices)
-                    balanced_indices = balanced_indices.sort().values
-                    
-                    img_t = img_t[balanced_indices].contiguous()
-                    img_labels_t = img_labels_t[balanced_indices].contiguous()
+                        img_labels_t = ret_d["class"]
+                        
+                        unique_values = img_labels_t.unique()
+                        label_to_indices = {val.item(): (img_labels_t == val).nonzero(as_tuple=True)[0] for val in unique_values}
+
+                        n_samples_per_class = self.num_frames // len(unique_values)
+                        
+                        for val in unique_values:
+                            indices = label_to_indices[val.item()]
+                            if len(indices) >= n_samples_per_class:
+                                sampled_indices = torch.randperm(len(indices))[:n_samples_per_class]
+                                balanced_indices.extend(indices[sampled_indices].tolist())
+                            else:
+                                sampled_indices = torch.randint(low=0, high=len(indices), size=(n_samples_per_class,))
+                                balanced_indices.extend(indices[sampled_indices].tolist())
+
+                        if len(balanced_indices) < self.num_frames:
+                            additional_indices = torch.randint(low=0, high=img_t.shape[0], size=(self.num_frames - len(balanced_indices),))
+                            balanced_indices.extend(additional_indices.tolist())
+                            
+                        balanced_indices = torch.tensor(balanced_indices)
+                        balanced_indices = balanced_indices.sort().values
+                        
+                        img_t = img_t[balanced_indices].contiguous()
+                        img_labels_t = img_labels_t[balanced_indices].contiguous()
+
+                    if ("scalar" in ret_d and isinstance(balanced_indices, torch.Tensor)):
+                        img_scalar_t = ret_d["scalar"]
+                        img_scalar_t = img_scalar_t[balanced_indices].contiguous()
+                        ret_d["scalar"] = img_scalar_t
+
                 else:
                     idx = torch.randint(low=0, high=img_t.shape[0], size=(self.num_frames,))
                     idx = idx.sort().values
 
                     img_t = img_t[idx].contiguous()
-                    img_labels_t = img_labels_t[idx].contiguous()
 
-            img_t = img_t.unsqueeze(0).repeat(3,1,1,1).contiguous()            
+                    if "class" in ret_d:
+                        img_labels_t = ret_d["class"]
+                        img_labels_t = img_labels_t[idx].contiguous()
+                        ret_d["class"] = img_labels_t
+                    
+                    if "scalar" in ret_d:
+                        img_scalar_t = ret_d["scalar"]
+                        img_scalar_t = img_scalar_t[idx].contiguous()
+                        ret_d["scalar"] = img_scalar_t
+                    
+
+            img_t = img_t.unsqueeze(0).repeat(3,1,1,1).contiguous()
+
+            if self.transform:
+                img_t = self.transform(img_t)
+
+            ret_d["img"] = img_t
 
         except Exception as e:
             print("Error reading cine: " + img_path)
             print("Error: " + str(e))
-            if self.num_frames == 1:
-                img_t = torch.zeros(256, 256, dtype=torch.float32)
-            elif self.num_frames == -1:
-                img_t = torch.zeros(1, 256, 256, dtype=torch.float32)
-            else:
-                img_t = torch.zeros(self.num_frames, 256, 256, dtype=torch.float32)        
+            ret_d["img"] = torch.zeros(3, 1, 256, 256, dtype=torch.float32)
+        
 
-        if self.transform:
-            img_t = self.transform(img_t)
-
-        return {"img": img_t, "tag": sweep_tag_t, "class": img_labels_t}
+        return ret_d
     
 class USAnnotatedBlindSweepDataModule(LightningDataModule):
     def __init__(self, *args, **kwargs):
@@ -1134,6 +1164,12 @@ class USAnnotatedBlindSweepDataModule(LightningDataModule):
                 self.frame_label_dict = json.load(f)
         else:
             self.frame_label_dict = None
+
+        if self.hparams.scalar_label_dict:
+            with open(self.hparams.scalar_label_dict, 'r') as f:
+                self.scalar_label_dict = json.load(f)
+        else:
+            self.scalar_label_dict = None
         
     @staticmethod
     def add_data_specific_args(parent_parser):
@@ -1148,23 +1184,25 @@ class USAnnotatedBlindSweepDataModule(LightningDataModule):
         group.add_argument('--img_column', type=str, default="file_path")
         group.add_argument('--tag_column', type=str, default="tag")
         group.add_argument('--frame_column', type=str, default="frame_index")
-        group.add_argument('--frame_label', type=str, default="annotation_label")
+        group.add_argument('--frame_label', type=str, default=None)
         group.add_argument('--frame_label_dict', type=str, default=None, help="Path to a json file containing the frame labels dictionary")
+        group.add_argument('--scalar_label', type=str, default=None)
+        group.add_argument('--scalar_label_dict', type=str, default=None, help="Path to a json file containing the frame labels dictionary")
         group.add_argument('--sample_balanced', type=int, default=0, help="Whether to sample balanced batches")
         group.add_argument('--id_column', type=str, default="annotation_id")
         group.add_argument('--batch_size', type=int, default=4, help="Batch size for the train dataloaders")
         group.add_argument('--num_frames', type=int, default=64, help="Number of frames to sample from each cine")
         group.add_argument('--num_workers', type=int, default=1)
         group.add_argument('--prefetch_factor', type=int, default=2)
-        group.add_argument('--drop_last', type=int, default=False)
+        group.add_argument('--drop_last', type=bool, default=False)
 
         return parent_parser        
 
     def setup(self, stage=None):
         # Assign train/val datasets for use in dataloaders        
-        self.train_ds = USAnnotatedBlindSweep(self.df_train, self.hparams.mount_point, img_column=self.hparams.img_column, tag_column=self.hparams.tag_column, frame_column=self.hparams.frame_column, frame_label=self.hparams.frame_label, id_column=self.hparams.id_column, num_frames=self.hparams.num_frames, transform=self.train_transform, frame_label_dict=self.frame_label_dict, sample_balanced=self.hparams.sample_balanced)
-        self.val_ds = USAnnotatedBlindSweep(self.df_valid, self.hparams.mount_point, img_column=self.hparams.img_column, tag_column=self.hparams.tag_column, frame_column=self.hparams.frame_column, frame_label=self.hparams.frame_label, id_column=self.hparams.id_column, num_frames=-1, transform=self.valid_transform, frame_label_dict=self.frame_label_dict)
-        self.test_ds = USAnnotatedBlindSweep(self.df_test, self.hparams.mount_point, img_column=self.hparams.img_column, tag_column=self.hparams.tag_column, frame_column=self.hparams.frame_column, frame_label=self.hparams.frame_label, id_column=self.hparams.id_column, num_frames=-1, transform=self.test_transform, frame_label_dict=self.frame_label_dict)
+        self.train_ds = USAnnotatedBlindSweep(self.df_train, self.hparams.mount_point, img_column=self.hparams.img_column, tag_column=self.hparams.tag_column, frame_column=self.hparams.frame_column, frame_label=self.hparams.frame_label, id_column=self.hparams.id_column, num_frames=self.hparams.num_frames, transform=self.train_transform, frame_label_dict=self.frame_label_dict, scalar_label=self.hparams.scalar_label, scalar_label_dict=self.scalar_label_dict, sample_balanced=self.hparams.sample_balanced)
+        self.val_ds = USAnnotatedBlindSweep(self.df_valid, self.hparams.mount_point, img_column=self.hparams.img_column, tag_column=self.hparams.tag_column, frame_column=self.hparams.frame_column, frame_label=self.hparams.frame_label, id_column=self.hparams.id_column, num_frames=-1, transform=self.valid_transform, frame_label_dict=self.frame_label_dict, scalar_label=self.hparams.scalar_label, scalar_label_dict=self.scalar_label_dict)
+        self.test_ds = USAnnotatedBlindSweep(self.df_test, self.hparams.mount_point, img_column=self.hparams.img_column, tag_column=self.hparams.tag_column, frame_column=self.hparams.frame_column, frame_label=self.hparams.frame_label, id_column=self.hparams.id_column, num_frames=-1, transform=self.test_transform, frame_label_dict=self.frame_label_dict, scalar_label=self.hparams.scalar_label, scalar_label_dict=self.scalar_label_dict)
 
     def collate_fn(self, batch):
 
@@ -1185,7 +1223,7 @@ class USAnnotatedBlindSweepDataModule(LightningDataModule):
         return DataLoader(self.train_ds, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, persistent_workers=True, pin_memory=True, drop_last=self.hparams.drop_last, shuffle=True, prefetch_factor=self.hparams.prefetch_factor)
 
     def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=1, num_workers=self.hparams.num_workers, drop_last=self.hparams.drop_last)
+        return DataLoader(self.val_ds, batch_size=1, num_workers=self.hparams.num_workers)
 
     def test_dataloader(self):
         return DataLoader(self.test_ds, batch_size=1, num_workers=self.hparams.num_workers)

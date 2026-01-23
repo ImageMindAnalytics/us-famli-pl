@@ -3,7 +3,7 @@ from torch import nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from .layers import TimeDistributed, AttentionChunk, MHABlock, SelfAttention, ProjectionHead
+from .layers import TimeDistributed, AttentionChunk, MHABlock, SelfAttention, ProjectionHead, RoPETransformerBlock
 
 import torchvision 
 from torchvision.transforms import v2
@@ -984,3 +984,232 @@ class FlyToClassification(LightningModule):
         x_hat = self.proj_final(z)
 
         return x_hat, z_t_s
+    
+class RopeEffnetV2s(LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        encoder = torchvision.models.efficientnet_v2_s(weights='IMAGENET1K_V1')
+        encoder.classifier = nn.Linear(self.hparams.features, self.hparams.embed_dim)
+
+        self.encoder = TimeDistributed(encoder)
+
+        self.rope = RoPETransformerBlock(dim=self.hparams.embed_dim, num_heads=self.hparams.num_heads, mlp_ratio=self.hparams.mlp_ratio, dropout=self.hparams.dropout)
+
+        self.norm = nn.LayerNorm(self.hparams.embed_dim)
+        
+        self.proj = nn.Linear(self.hparams.embed_dim, 1)
+        
+        self.act = nn.Sigmoid()
+
+        self.train_transform = v2.Compose(
+            [
+                v2.RandomHorizontalFlip(),
+                v2.RandomRotation(180),
+                v2.RandomResizedCrop(size=256, scale=(0.25, 1.0), ratio=(0.75, 1.3333333333333333)),
+                v2.RandomApply([v2.GaussianBlur(5, sigma=(0.1, 2.0))], p=0.5),
+                v2.ColorJitter(brightness=[0.5, 1.5], contrast=[0.5, 1.5], saturation=[0.5, 1.5], hue=[-.2, .2])
+            ]
+        )
+
+        self.loss_fn = nn.L1Loss(reduction='sum')
+        # self.loss_fn = nn.HuberLoss(delta=5.0, reduction='sum')
+        self.l1_loss = nn.L1Loss()
+
+        self.mae = MeanAbsoluteError()
+        self.mse = MeanSquaredError()
+
+        self.preds = CatMetric()
+        self.targets = CatMetric()
+
+
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        group = parent_parser.add_argument_group("BCE with Regression Model")
+
+        group.add_argument("--lr", type=float, default=1e-3)
+        group.add_argument("--betas", type=float, nargs="+", default=(0.9, 0.999), help='Betas for Adam optimizer')
+        group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=1e-2)
+        
+        # Image Encoder parameters 
+        group.add_argument("--spatial_dims", type=int, default=2, help='Spatial dimensions for the encoder')
+        group.add_argument("--in_channels", type=int, default=3, help='Input channels for encoder')
+        group.add_argument("--features", type=int, default=1280, help='Number of output features for the encoder')
+        group.add_argument("--embed_dim", type=int, default=128, help='Embedding dimension for the model')
+        group.add_argument("--num_heads", type=int, default=8, help='Number of heads for RoPE transformer')
+        group.add_argument("--mlp_ratio", type=float, default=4.0, help='MLP ratio for RoPE transformer')
+        group.add_argument("--dropout", type=float, default=0.2, help='Dropout rate for RoPE transformer')
+
+        return parent_parser
+    
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(),
+                                lr=self.hparams.lr,
+                                betas=self.hparams.betas,
+                                weight_decay=self.hparams.weight_decay)
+        return optimizer
+    
+    def compute_loss(self, Y, X_hat, step="train", sync_dist=False):
+
+        # print("Y unique:", torch.unique(Y))
+        # print("Y min/max:", Y.min().item(), Y.max().item())
+        # print("Number of zeros in Y:", (Y == 0).sum().item())
+
+        # print("X_hat min/max:", X_hat.min().item(), X_hat.max().item())
+        # print("Number of zeros in X_hat:", (X_hat == 0).sum().item())
+        
+        loss = self.loss_fn(X_hat, Y.float())
+        self.log(f"{step}_loss", loss, sync_dist=sync_dist)
+
+        l1 = self.l1_loss(X_hat, Y.float())
+        self.log(f"{step}_l1", l1, sync_dist=sync_dist)
+
+        self.mae(X_hat, Y)
+        self.mse(X_hat, Y)
+
+        self.log(f"{step}_mae", self.mae, sync_dist=sync_dist)
+        self.log(f"{step}_mse", self.mse, sync_dist=sync_dist)
+
+        return loss
+
+    def training_step(self, train_batch, batch_idx):
+        X = train_batch["img"]
+        Y = train_batch["scalar"]
+
+        X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
+
+        x_hat = self(self.train_transform(X))
+
+        return self.compute_loss(Y=Y, X_hat=x_hat, step="train")
+
+    def validation_step(self, val_batch, batch_idx):
+        
+        X = val_batch["img"]
+        Y = val_batch["scalar"]
+
+        X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
+
+        x_hat = self(X)
+
+        self.compute_loss(Y=Y, X_hat=x_hat, step="val", sync_dist=True)
+
+        self.preds.update(x_hat.view(-1))
+        self.targets.update(Y.view(-1))
+
+    def on_validation_epoch_end(self):
+        
+        preds = self.preds.compute().view(-1)
+        targets = self.targets.compute().view(-1)
+
+        # compute metrics
+        mae = self.mae.compute()
+        mse = self.mse.compute()
+        # reset metrics for next epoch
+        self.mae.reset()
+        self.mse.reset()
+
+        # OPTIONAL: create a scatter plot y_true vs y_pred and upload to Neptune
+        if self.trainer.is_global_zero:
+
+            logger = self.trainer.logger
+            run = logger.experiment  
+            
+            fig, ax = plt.subplots()
+            ax.scatter(targets.cpu(), preds.cpu(), alpha=0.4)
+            ax.plot([0, 1.1], [0, 1.1])  # identity line
+            ax.set_xlabel("True quality score")
+            ax.set_ylabel("Predicted quality score")
+            ax.set_title("Validation: y_true vs y_pred")
+
+            experiment = None
+            if isinstance(logger, NeptuneLogger):
+                experiment = run["images/val_regression_scatter"]
+                experiment.upload(fig)
+            else:
+                plt.savefig(os.path.join(self.hparams.out, "val_regression_scatter.png"))
+            plt.close(fig)
+
+            # Example JSON report
+            report_dict = {
+                "mae": float(mae.cpu()),
+                "mse": float(mse.cpu()),
+                "rmse": float(torch.sqrt(mse).cpu())
+            }
+
+            if isinstance(logger, NeptuneLogger):
+                run["reports/val_regression_report"].upload(
+                    File.from_content(json.dumps(report_dict), extension="json")
+                )
+            else:
+                print(json.dumps(report_dict, indent=4))
+
+        self.preds.reset()
+        self.targets.reset()
+
+    def test_step(self, test_batch, batch_idx):
+        X = test_batch["img"]
+        Y = test_batch["scalar"]
+
+        x_hat = self(X)
+
+        self.compute_loss(Y=Y, X_hat=x_hat, step="test", sync_dist=True)
+        
+        self.preds.update(x_hat.view(-1))
+        self.targets.update(Y.view(-1))
+
+    def on_test_epoch_end(self):
+
+        preds = self.preds.compute().view(-1)
+        targets = self.targets.compute().view(-1)
+
+        # compute metrics
+        mae = self.mae.compute()
+        mse = self.mse.compute()
+        # reset metrics for next epoch
+        self.mae.reset()
+        self.mse.reset()
+
+        # OPTIONAL: create a scatter plot y_true vs y_pred and upload to Neptune
+        if self.trainer.is_global_zero:
+
+            logger = self.trainer.logger
+            run = logger.experiment  
+            
+            fig, ax = plt.subplots()
+            ax.scatter(targets.cpu(), preds.cpu(), alpha=0.4)
+            ax.plot([0, 1.1], [0, 1.1])  # identity line
+            ax.set_xlabel("True quality score")
+            ax.set_ylabel("Predicted quality score")
+            ax.set_title("Validation: y_true vs y_pred")
+
+            experiment = None
+            if isinstance(logger, NeptuneLogger):
+                experiment = run["images/test_regression_scatter"]
+                experiment.upload(fig)
+            plt.close(fig)
+
+            # Example JSON report
+            report_dict = {
+                "mae": float(mae.cpu()),
+                "mse": float(mse.cpu()),
+                "rmse": float(torch.sqrt(mse).cpu())
+            }
+
+            if isinstance(logger, NeptuneLogger):
+                run["reports/test_regression_report"].upload(
+                    File.from_content(json.dumps(report_dict), extension="json")
+                )
+            else:
+                print(json.dumps(report_dict, indent=4))
+
+        self.preds.reset()
+        self.targets.reset()
+
+    def forward(self, x: torch.tensor):
+
+        z = self.encoder(x)
+        z = self.rope(z)
+        z = self.norm(z)
+
+        return self.act(self.proj(z).squeeze(-1))

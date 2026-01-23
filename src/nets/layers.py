@@ -532,3 +532,168 @@ class HeteroscedasticHead(nn.Module):
         log_var = self.log_var(h).squeeze(-1)  # [B]
         log_var = torch.clamp(log_var, min=-10.0, max=10.0)  # numerical safety
         return mu, log_var
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """
+    Split last dim into pairs and rotate: (x1, x2) -> (-x2, x1)
+    x: (..., D) where D is even
+    """
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    Apply rotary embedding to x.
+    x: (B, H, T, Dh)
+    cos/sin: (1, 1, T, Dh) broadcastable
+    """
+    return (x * cos) + (rotate_half(x) * sin)
+
+
+class RoPECache(nn.Module):
+    """
+    Caches cos/sin for RoPE for a given head dimension.
+    """
+    def __init__(self, head_dim: int, base: float = 10000.0):
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
+        self.head_dim = head_dim
+        self.base = base
+
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        self._seq_len_cached = 0
+        self.register_buffer("_cos_cached", torch.empty(0), persistent=False)
+        self.register_buffer("_sin_cached", torch.empty(0), persistent=False)
+
+    def get_cos_sin(self, seq_len: int, device=None, dtype=None):
+        if seq_len <= self._seq_len_cached and self._cos_cached.device == (device or self._cos_cached.device) and self._cos_cached.dtype == (dtype or self._cos_cached.dtype):
+            cos = self._cos_cached[..., :seq_len, :]
+            sin = self._sin_cached[..., :seq_len, :]
+            return cos, sin
+
+        device = device or self.inv_freq.device
+        dtype = dtype or torch.float32
+
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)  # (T,)
+        freqs = torch.einsum("t,f->tf", t, self.inv_freq)  # (T, Dh/2)
+
+        # Interleave to match Dh: [cos0, cos0, cos1, cos1, ...]
+        emb = torch.cat([freqs, freqs], dim=-1)  # (T, Dh)
+
+        cos = emb.cos().to(dtype=dtype)[None, None, :, :]  # (1,1,T,Dh)
+        sin = emb.sin().to(dtype=dtype)[None, None, :, :]  # (1,1,T,Dh)
+
+        self._seq_len_cached = seq_len
+        self._cos_cached = cos
+        self._sin_cached = sin
+        return cos, sin
+
+
+class RoPESelfAttention(nn.Module):
+    """
+    Multi-head self-attention with RoPE applied to Q and K.
+    Input:  x (B, T, C)
+    Output: y (B, T, C)
+
+    key_padding_mask: (B, T) with True for positions to MASK (padding),
+                      or False for valid tokens.
+    causal: if True, applies a causal (future-masking) triangle.
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        attn_dropout: float = 0.0,
+        proj_dropout: float = 0.0,
+        rope_base: float = 10000.0,
+    ):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+
+        self.attn_dropout = nn.Dropout(attn_dropout)
+        self.proj_dropout = nn.Dropout(proj_dropout)
+
+        self.rope = RoPECache(head_dim=self.head_dim, base=rope_base)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None, causal: bool = False):
+        B, T, C = x.shape
+
+        qkv = self.qkv(x)  # (B,T,3C)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # (B, H, T, Dh)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rope.get_cos_sin(T, device=x.device, dtype=q.dtype)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        # attention scores: (B,H,T,T)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Padding mask: True means "mask out"
+        if key_padding_mask is not None:
+            # key_padding_mask: (B,T) -> (B,1,1,T)
+            mask = key_padding_mask[:, None, None, :].to(torch.bool)
+            scores = scores.masked_fill(mask, float("-inf"))
+
+        # Causal mask
+        if causal:
+            causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+            scores = scores.masked_fill(causal_mask[None, None, :, :], float("-inf"))
+
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
+
+        out = torch.matmul(attn, v)  # (B,H,T,Dh)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)  # (B,T,C)
+
+        out = self.proj(out)
+        out = self.proj_dropout(out)
+        return out
+
+
+class RoPETransformerBlock(nn.Module):
+    """
+    Standard Pre-LN Transformer block using RoPE attention.
+    """
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(dim)
+        self.attn = RoPESelfAttention(dim, num_heads, attn_dropout=dropout, proj_dropout=dropout)
+        self.ln2 = nn.LayerNorm(dim)
+
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None, causal: bool = False):
+        x = x + self.attn(self.ln1(x), key_padding_mask=key_padding_mask, causal=causal)
+        x = x + self.mlp(self.ln2(x))
+        return x
