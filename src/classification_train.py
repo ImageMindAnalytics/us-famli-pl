@@ -19,6 +19,9 @@ from lightning.pytorch.loggers import NeptuneLogger
 
 def main(args):
 
+    if args.out and not os.path.exists(args.out):
+        os.makedirs(args.out)
+
     deterministic = None
     if args.seed_everything:
         seed_everything(args.seed_everything, workers=True)
