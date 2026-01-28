@@ -984,7 +984,71 @@ class FlyToClassification(LightningModule):
         x_hat = self.proj_final(z)
 
         return x_hat, z_t_s
-    
+
+
+class OrdinalEMDLoss(nn.Module):
+    def __init__(self, sigma=0.12, bins=(0.0, 0.25, 0.5, 0.75, 1.0), class_weights=None):
+        super().__init__()
+        self.sigma = sigma
+        self.register_buffer("bins", torch.tensor(bins, dtype=torch.float32))
+        if class_weights is not None:
+            self.register_buffer("class_weights", torch.tensor(class_weights, dtype=torch.float32))
+        else:
+            self.class_weights = None
+
+    def soft_targets(self, y):  # y: (M,)
+        d2 = (self.bins[None, :] - y[:, None]) ** 2
+        p = torch.exp(-0.5 * d2 / (self.sigma ** 2))
+        return p / (p.sum(dim=1, keepdim=True) + 1e-8)
+
+    def forward(self, logits, y, y_class=None, mask=None):
+        """
+        logits: (B,N,5)
+        y:      (B,N) or (B,N,1) in [0,1] (mapped scores)
+        y_class:(B,N) optional int 0..4 for weighting
+        mask:   (B,N) bool, optional (valid frames)
+        """
+        if y.ndim == 3:
+            y = y.squeeze(-1)
+
+        B, N, C = logits.shape
+
+        # flatten frames
+        M = B * N
+        logits_f = logits.reshape(M, C)
+        y_f = y.reshape(M)
+
+        if mask is not None:
+            mask_f = mask.reshape(M)
+            logits_f = logits_f[mask_f]
+            y_f = y_f[mask_f]
+            if y_class is not None:
+                y_class = y_class.reshape(M)[mask_f]
+        else:
+            if y_class is not None:
+                y_class = y_class.reshape(M)
+
+        target = self.soft_targets(y_f)              # (m,C)
+        p = F.softmax(logits_f, dim=1)               # (m,C)
+        cdf_p = torch.cumsum(p, dim=1)
+        cdf_t = torch.cumsum(target, dim=1)
+
+        # per = torch.mean(torch.abs(cdf_p - cdf_t), dim=1)  # (m,)
+
+        w_bins = torch.arange(1, C+1, device=logits_f.device, dtype=logits_f.dtype)  # 1..5
+        w_bins = w_bins / w_bins.mean()
+        per = (torch.abs(cdf_p - cdf_t) * w_bins).mean(dim=1)
+
+        if self.class_weights is not None and y_class is not None:
+            per = per * self.class_weights[y_class]
+
+        return per.mean()
+
+    @torch.no_grad()
+    def expected_score(self, logits):  # logits: (B,N,5)
+        p = F.softmax(logits, dim=-1)
+        return (p * self.bins).sum(dim=-1, keepdim=True)  # (B,N,1)
+
 class RopeEffnetV2s(LightningModule):
     def __init__(self, **kwargs):
         super().__init__()
@@ -999,9 +1063,7 @@ class RopeEffnetV2s(LightningModule):
 
         self.norm = nn.LayerNorm(self.hparams.embed_dim)
         
-        self.proj = nn.Linear(self.hparams.embed_dim, 1)
-        
-        self.act = nn.Sigmoid()
+        self.proj = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
 
         self.train_transform = v2.Compose(
             [
@@ -1013,14 +1075,13 @@ class RopeEffnetV2s(LightningModule):
             ]
         )
 
-        self.loss_fn = nn.L1Loss(reduction='sum')
-        # self.loss_fn = nn.HuberLoss(delta=5.0, reduction='sum')
-        self.l1_loss = nn.L1Loss()
+        self.loss_fn = OrdinalEMDLoss(sigma=self.hparams.sigma, bins=self.hparams.bins, class_weights=self.hparams.class_weights)
+        
 
-        self.mae = MeanAbsoluteError()
-        self.mse = MeanSquaredError()
+        self.accuracy = Accuracy(task='multiclass', num_classes=self.hparams.num_classes)
+        self.conf = torchmetrics.ConfusionMatrix(task='multiclass', num_classes=self.hparams.num_classes, normalize='true')
 
-        self.preds = CatMetric()
+        self.probs = CatMetric()
         self.targets = CatMetric()
 
 
@@ -1031,6 +1092,11 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--lr", type=float, default=1e-3)
         group.add_argument("--betas", type=float, nargs="+", default=(0.9, 0.999), help='Betas for Adam optimizer')
         group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=1e-2)
+
+        group.add_argument("--sigma", type=float, default=0.12, help='Sigma for Ordinal EMD Loss')
+        group.add_argument("--bins", type=float, nargs="+", default=(0.0, 0.25, 0.5, 0.75, 1.0), help='Bins for Ordinal EMD Loss')
+        group.add_argument("--class_weights", type=float, nargs="+", default=[0.05, 0.20, 1.00, 2.50, 6.00], help='Class weights for Ordinal EMD Loss')
+        group.add_argument("--num_classes", type=int, default=5, help='Output channels for projection head')
         
         # Image Encoder parameters 
         group.add_argument("--spatial_dims", type=int, default=2, help='Spatial dimensions for the encoder')
@@ -1050,7 +1116,7 @@ class RopeEffnetV2s(LightningModule):
                                 weight_decay=self.hparams.weight_decay)
         return optimizer
     
-    def compute_loss(self, Y, X_hat, step="train", sync_dist=False):
+    def compute_loss(self, Y_s, X_hat, Y_c=None, step="train", sync_dist=False):
 
         # print("Y unique:", torch.unique(Y))
         # print("Y min/max:", Y.min().item(), Y.max().item())
@@ -1059,152 +1125,120 @@ class RopeEffnetV2s(LightningModule):
         # print("X_hat min/max:", X_hat.min().item(), X_hat.max().item())
         # print("Number of zeros in X_hat:", (X_hat == 0).sum().item())
         
-        loss = self.loss_fn(X_hat, Y.float())
+        loss = self.loss_fn(X_hat, y=Y_s.float(), y_class=Y_c)
         self.log(f"{step}_loss", loss, sync_dist=sync_dist)
-
-        l1 = self.l1_loss(X_hat, Y.float())
-        self.log(f"{step}_l1", l1, sync_dist=sync_dist)
-
-        self.mae(X_hat, Y)
-        self.mse(X_hat, Y)
-
-        self.log(f"{step}_mae", self.mae, sync_dist=sync_dist)
-        self.log(f"{step}_mse", self.mse, sync_dist=sync_dist)
 
         return loss
 
     def training_step(self, train_batch, batch_idx):
         X = train_batch["img"]
-        Y = train_batch["scalar"]
+        Y_s = train_batch["scalar"]
+        Y_c = train_batch["class"]
 
         X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
 
         x_hat = self(self.train_transform(X))
 
-        return self.compute_loss(Y=Y, X_hat=x_hat, step="train")
+        return self.compute_loss(Y_s=Y_s, Y_c=Y_c, X_hat=x_hat, step="train")
 
     def validation_step(self, val_batch, batch_idx):
         
         X = val_batch["img"]
-        Y = val_batch["scalar"]
+        Y_s = val_batch["scalar"]
+        Y_c = val_batch["class"]
 
         X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
 
         x_hat = self(X)
 
-        self.compute_loss(Y=Y, X_hat=x_hat, step="val", sync_dist=True)
+        self.compute_loss(Y_s=Y_s, Y_c=Y_c, X_hat=x_hat, step="val", sync_dist=True)
 
-        self.preds.update(x_hat.view(-1))
-        self.targets.update(Y.view(-1))
-
+        Y_c = Y_c.view(-1)
+        x_hat = x_hat.view(-1, self.hparams.num_classes)
+        
+        self.probs.update(x_hat.softmax(dim=-1))
+        self.targets.update(Y_c)
+        self.conf.update(x_hat, Y_c)
+        
     def on_validation_epoch_end(self):
         
-        preds = self.preds.compute().view(-1)
-        targets = self.targets.compute().view(-1)
+        probs = self.probs.compute()
+        targets = self.targets.compute()
+        confmat  = self.conf.compute()
 
-        # compute metrics
-        mae = self.mae.compute()
-        mse = self.mse.compute()
-        # reset metrics for next epoch
-        self.mae.reset()
-        self.mse.reset()
-
-        # OPTIONAL: create a scatter plot y_true vs y_pred and upload to Neptune
         if self.trainer.is_global_zero:
+            fig_cm = plt.figure()
+            plt.imshow(confmat.cpu().numpy(), interpolation='nearest')
+            plt.title("Confusion Matrix")
+            plt.xlabel("Predicted")
+            plt.ylabel("True")
+            plt.colorbar()
+            plt.tight_layout()
 
-            logger = self.trainer.logger
-            run = logger.experiment  
-            
-            fig, ax = plt.subplots()
-            ax.scatter(targets.cpu(), preds.cpu(), alpha=0.4)
-            ax.plot([0, 1.1], [0, 1.1])  # identity line
-            ax.set_xlabel("True quality score")
-            ax.set_ylabel("Predicted quality score")
-            ax.set_title("Validation: y_true vs y_pred")
-
-            experiment = None
-            if isinstance(logger, NeptuneLogger):
-                experiment = run["images/val_regression_scatter"]
-                experiment.upload(fig)
+            if isinstance(self.trainer.logger, NeptuneLogger):
+                self.trainer.logger.experiment["images/val_Confusion_Matrix"].upload(fig_cm)
             else:
-                plt.savefig(os.path.join(self.hparams.out, "val_regression_scatter.png"))
-            plt.close(fig)
+                out_path = None
+                out_path =  os.path.join(self.hparams.out, "val_confusion_matrix.png")
+                if not os.path.exists(self.hparams.out):
+                    os.makedirs(self.hparams.out)
+                plt.savefig(out_path)
+            plt.close(fig_cm)
 
-            # Example JSON report
-            report_dict = {
-                "mae": float(mae.cpu()),
-                "mse": float(mse.cpu()),
-                "rmse": float(torch.sqrt(mse).cpu())
-            }
+            print(classification_report(targets.cpu().numpy(), probs.argmax(dim=-1).cpu().numpy(), digits=3))
 
-            if isinstance(logger, NeptuneLogger):
-                run["reports/val_regression_report"].upload(
-                    File.from_content(json.dumps(report_dict), extension="json")
-                )
-            else:
-                print(json.dumps(report_dict, indent=4))
-
-        self.preds.reset()
+        self.probs.reset()
         self.targets.reset()
+        self.conf.reset()
 
     def test_step(self, test_batch, batch_idx):
         X = test_batch["img"]
-        Y = test_batch["scalar"]
+        Y_s = test_batch["scalar"]
+        Y_c = test_batch["class"]
+
+        X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
 
         x_hat = self(X)
 
-        self.compute_loss(Y=Y, X_hat=x_hat, step="test", sync_dist=True)
+        self.compute_loss(Y_s=Y_s, Y_c=Y_c, X_hat=x_hat, step="test", sync_dist=True)
         
-        self.preds.update(x_hat.view(-1))
-        self.targets.update(Y.view(-1))
+        Y_c = Y_c.view(-1)
+        x_hat = x_hat.view(-1, self.hparams.num_classes)
+        
+        self.probs.update(x_hat.softmax(dim=-1))
+        self.targets.update(Y_c)
+        self.conf.update(x_hat, Y_c)
 
     def on_test_epoch_end(self):
+        probs = self.probs.compute()
+        targets = self.targets.compute()
+        confmat  = self.conf.compute()
 
-        preds = self.preds.compute().view(-1)
-        targets = self.targets.compute().view(-1)
-
-        # compute metrics
-        mae = self.mae.compute()
-        mse = self.mse.compute()
-        # reset metrics for next epoch
-        self.mae.reset()
-        self.mse.reset()
-
-        # OPTIONAL: create a scatter plot y_true vs y_pred and upload to Neptune
         if self.trainer.is_global_zero:
+            fig_cm = plt.figure()
+            plt.imshow(confmat.cpu().numpy(), interpolation='nearest')
+            plt.title("Confusion Matrix")
+            plt.xlabel("Predicted")
+            plt.ylabel("True")
+            plt.colorbar()
+            plt.tight_layout()
 
-            logger = self.trainer.logger
-            run = logger.experiment  
-            
-            fig, ax = plt.subplots()
-            ax.scatter(targets.cpu(), preds.cpu(), alpha=0.4)
-            ax.plot([0, 1.1], [0, 1.1])  # identity line
-            ax.set_xlabel("True quality score")
-            ax.set_ylabel("Predicted quality score")
-            ax.set_title("Validation: y_true vs y_pred")
-
-            experiment = None
-            if isinstance(logger, NeptuneLogger):
-                experiment = run["images/test_regression_scatter"]
-                experiment.upload(fig)
-            plt.close(fig)
-
-            # Example JSON report
-            report_dict = {
-                "mae": float(mae.cpu()),
-                "mse": float(mse.cpu()),
-                "rmse": float(torch.sqrt(mse).cpu())
-            }
-
-            if isinstance(logger, NeptuneLogger):
-                run["reports/test_regression_report"].upload(
-                    File.from_content(json.dumps(report_dict), extension="json")
-                )
+            if isinstance(self.trainer.logger, NeptuneLogger):
+                self.trainer.logger.experiment["images/test_Confusion_Matrix"].upload(fig_cm)
             else:
-                print(json.dumps(report_dict, indent=4))
+                out_path = None
+                out_path =  os.path.join(self.hparams.out, "test_confusion_matrix.png")
+                if not os.path.exists(self.hparams.out):
+                    os.makedirs(self.hparams.out)
+                plt.savefig(out_path)
+            plt.close(fig_cm)
 
-        self.preds.reset()
+            print(classification_report(targets.cpu().numpy(), probs.argmax(dim=-1).cpu().numpy(), digits=3))
+
+        self.probs.reset()
         self.targets.reset()
+        self.conf.reset()
+        
 
     def forward(self, x: torch.tensor):
 
@@ -1212,4 +1246,4 @@ class RopeEffnetV2s(LightningModule):
         z = self.rope(z)
         z = self.norm(z)
 
-        return self.act(self.proj(z).squeeze(-1))
+        return self.proj(z)

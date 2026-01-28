@@ -1065,7 +1065,7 @@ class USAnnotatedBlindSweep(Dataset):
                 img_labels_t = torch.zeros(img_t.shape[0], dtype=torch.float32)
                 img_labels_t[frame_idx] = torch.tensor(frame_labels_idx, dtype=torch.float32)
                 
-                ret_d["class"] = img_labels_t
+                ret_d["class"] = img_labels_t.long()
             
             if self.scalar_label is not None:
                 
@@ -1123,7 +1123,7 @@ class USAnnotatedBlindSweep(Dataset):
                     if "class" in ret_d:
                         img_labels_t = ret_d["class"]
                         img_labels_t = img_labels_t[idx].contiguous()
-                        ret_d["class"] = img_labels_t
+                        ret_d["class"] = img_labels_t.long()
                     
                     if "scalar" in ret_d:
                         img_scalar_t = ret_d["scalar"]
