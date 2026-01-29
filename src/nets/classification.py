@@ -1078,7 +1078,8 @@ class RopeEffnetV2s(LightningModule):
             ]
         )
 
-        self.loss_fn = OrdinalEMDLoss(sigma=self.hparams.sigma, bins=self.hparams.bins, class_weights=self.hparams.class_weights, bin_weights=self.hparams.bin_weights)
+        bin_weights = self.hparams.bin_weights if hasattr(self.hparams, 'bin_weights') else None
+        self.loss_fn = OrdinalEMDLoss(sigma=self.hparams.sigma, bins=self.hparams.bins, class_weights=self.hparams.class_weights, bin_weights=bin_weights)
         
 
         self.accuracy = Accuracy(task='multiclass', num_classes=self.hparams.num_classes)
