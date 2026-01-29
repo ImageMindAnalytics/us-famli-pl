@@ -987,7 +987,7 @@ class FlyToClassification(LightningModule):
 
 
 class OrdinalEMDLoss(nn.Module):
-    def __init__(self, sigma=0.12, bins=(0.0, 0.25, 0.5, 0.75, 1.0), class_weights=None):
+    def __init__(self, sigma=0.12, bins=(0.0, 0.25, 0.5, 0.75, 1.0), class_weights=None, bin_weights=None):
         super().__init__()
         self.sigma = sigma
         self.register_buffer("bins", torch.tensor(bins, dtype=torch.float32))
@@ -995,7 +995,10 @@ class OrdinalEMDLoss(nn.Module):
             self.register_buffer("class_weights", torch.tensor(class_weights, dtype=torch.float32))
         else:
             self.class_weights = None
-
+        if bin_weights is not None:
+            self.register_buffer("bin_weights", torch.tensor(bin_weights, dtype=torch.float32))
+        else:
+            self.bin_weights = None
     def soft_targets(self, y):  # y: (M,)
         d2 = (self.bins[None, :] - y[:, None]) ** 2
         p = torch.exp(-0.5 * d2 / (self.sigma ** 2))
@@ -1033,11 +1036,11 @@ class OrdinalEMDLoss(nn.Module):
         cdf_p = torch.cumsum(p, dim=1)
         cdf_t = torch.cumsum(target, dim=1)
 
-        # per = torch.mean(torch.abs(cdf_p - cdf_t), dim=1)  # (m,)
 
-        w_bins = torch.arange(1, C+1, device=logits_f.device, dtype=logits_f.dtype)  # 1..5
-        w_bins = w_bins / w_bins.mean()
-        per = (torch.abs(cdf_p - cdf_t) * w_bins).mean(dim=1)
+        if self.bin_weights is not None:
+            per = (torch.abs(cdf_p - cdf_t) * self.bin_weights).mean(dim=1)
+        else:
+            per = torch.mean(torch.abs(cdf_p - cdf_t), dim=1)  # (m,)
 
         if self.class_weights is not None and y_class is not None:
             per = per * self.class_weights[y_class]
@@ -1075,7 +1078,7 @@ class RopeEffnetV2s(LightningModule):
             ]
         )
 
-        self.loss_fn = OrdinalEMDLoss(sigma=self.hparams.sigma, bins=self.hparams.bins, class_weights=self.hparams.class_weights)
+        self.loss_fn = OrdinalEMDLoss(sigma=self.hparams.sigma, bins=self.hparams.bins, class_weights=self.hparams.class_weights, bin_weights=self.hparams.bin_weights)
         
 
         self.accuracy = Accuracy(task='multiclass', num_classes=self.hparams.num_classes)
@@ -1095,7 +1098,8 @@ class RopeEffnetV2s(LightningModule):
 
         group.add_argument("--sigma", type=float, default=0.12, help='Sigma for Ordinal EMD Loss')
         group.add_argument("--bins", type=float, nargs="+", default=(0.0, 0.25, 0.5, 0.75, 1.0), help='Bins for Ordinal EMD Loss')
-        group.add_argument("--class_weights", type=float, nargs="+", default=[0.05, 0.20, 1.00, 2.50, 6.00], help='Class weights for Ordinal EMD Loss')
+        group.add_argument("--class_weights", type=float, nargs="+", default=[0.03603907, 0.14391553, 0.85467111, 1.73506923, 2.23030506], help='Class weights for Ordinal EMD Loss')
+        group.add_argument("--bin_weights", type=float, nargs="+", default=[0.23809524, 0.47619048, 0.71428571, 1.19047619, 2.38095238], help='Bin weights for Ordinal EMD Loss')
         group.add_argument("--num_classes", type=int, default=5, help='Output channels for projection head')
         
         # Image Encoder parameters 
