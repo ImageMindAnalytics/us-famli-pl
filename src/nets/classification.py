@@ -987,36 +987,82 @@ class FlyToClassification(LightningModule):
 
 
 class OrdinalEMDLoss(nn.Module):
-    def __init__(self, sigma=0.12, bins=(0.0, 0.25, 0.5, 0.75, 1.0), class_weights=None, bin_weights=None):
+    def __init__(
+        self,
+        sigma=(0.12, 0.12, 0.12, 0.10, 0.07),
+        bins=(0.0, 0.25, 0.5, 0.75, 1.0),
+        class_weights=None,
+        bin_weights=None,
+        normalize_bin_weights: bool = True,
+    ):
         super().__init__()
-        self.sigma = sigma
+
         self.register_buffer("bins", torch.tensor(bins, dtype=torch.float32))
+        C = len(bins)
+
+        # sigma: float OR sequence length C
+        if isinstance(sigma, (float, int)):
+            sigma_vec = torch.full((C,), float(sigma), dtype=torch.float32)
+        else:
+            sigma_vec = torch.tensor(list(sigma), dtype=torch.float32)
+            if sigma_vec.numel() != C:
+                raise ValueError(f"sigma must be float or length {C}, got length {sigma_vec.numel()}")
+        self.register_buffer("sigma_vec", sigma_vec)
+
         if class_weights is not None:
-            self.register_buffer("class_weights", torch.tensor(class_weights, dtype=torch.float32))
+            cw = torch.tensor(class_weights, dtype=torch.float32)
+            if cw.numel() != C:
+                raise ValueError(f"class_weights must be length {C}, got length {cw.numel()}")
+            self.register_buffer("class_weights", cw)
         else:
             self.class_weights = None
+
         if bin_weights is not None:
-            self.register_buffer("bin_weights", torch.tensor(bin_weights, dtype=torch.float32))
+            bw = torch.tensor(bin_weights, dtype=torch.float32)
+            if bw.numel() != C:
+                raise ValueError(f"bin_weights must be length {C}, got length {bw.numel()}")
+            if normalize_bin_weights:
+                bw = bw / (bw.mean() + 1e-8)
+            self.register_buffer("bin_weights", bw)
         else:
             self.bin_weights = None
-    def soft_targets(self, y):  # y: (M,)
-        d2 = (self.bins[None, :] - y[:, None]) ** 2
-        p = torch.exp(-0.5 * d2 / (self.sigma ** 2))
+
+    def soft_targets(self, y: torch.Tensor, y_class: torch.Tensor | None = None):
+        """
+        y:       (m,) in [0,1]
+        y_class: (m,) int 0..C-1 optional. If provided and sigma was per-class,
+                 sigma is selected per-sample based on y_class.
+                 If not provided, uses a single sigma (sigma_vec[0]) for all.
+        returns: (m,C) soft target distribution
+        """
+        bins = self.bins  # (C,)
+
+        if y_class is not None:
+            # per-sample sigma picked by class
+            sigma = self.sigma_vec[y_class].clamp_min(1e-6)  # (m,)
+        else:
+            # fallback: single sigma (works even if sigma_vec was per-class)
+            sigma = self.sigma_vec[0].clamp_min(1e-6)        # scalar
+
+        d2 = (bins[None, :] - y[:, None]) ** 2  # (m,C)
+        # broadcast sigma: (m,1) or scalar
+        p = torch.exp(-0.5 * d2 / (sigma[..., None] ** 2))
         return p / (p.sum(dim=1, keepdim=True) + 1e-8)
 
     def forward(self, logits, y, y_class=None, mask=None):
         """
-        logits: (B,N,5)
-        y:      (B,N) or (B,N,1) in [0,1] (mapped scores)
-        y_class:(B,N) optional int 0..4 for weighting
-        mask:   (B,N) bool, optional (valid frames)
+        logits:  (B,N,C)
+        y:       (B,N) or (B,N,1) in [0,1]
+        y_class: (B,N) optional int 0..C-1
+        mask:    (B,N) bool optional
         """
         if y.ndim == 3:
             y = y.squeeze(-1)
 
         B, N, C = logits.shape
+        if C != self.bins.numel():
+            raise ValueError(f"logits has C={C} but bins has {self.bins.numel()}")
 
-        # flatten frames
         M = B * N
         logits_f = logits.reshape(M, C)
         y_f = y.reshape(M)
@@ -1031,16 +1077,17 @@ class OrdinalEMDLoss(nn.Module):
             if y_class is not None:
                 y_class = y_class.reshape(M)
 
-        target = self.soft_targets(y_f)              # (m,C)
-        p = F.softmax(logits_f, dim=1)               # (m,C)
+        target = self.soft_targets(y_f, y_class=y_class)  # (m,C)
+        p = F.softmax(logits_f, dim=1)                    # (m,C)
         cdf_p = torch.cumsum(p, dim=1)
         cdf_t = torch.cumsum(target, dim=1)
 
+        diff = torch.abs(cdf_p - cdf_t)                   # (m,C)
 
         if self.bin_weights is not None:
-            per = (torch.abs(cdf_p - cdf_t) * self.bin_weights).mean(dim=1)
+            per = (diff * self.bin_weights).mean(dim=1)
         else:
-            per = torch.mean(torch.abs(cdf_p - cdf_t), dim=1)  # (m,)
+            per = diff.mean(dim=1)
 
         if self.class_weights is not None and y_class is not None:
             per = per * self.class_weights[y_class]
@@ -1048,9 +1095,10 @@ class OrdinalEMDLoss(nn.Module):
         return per.mean()
 
     @torch.no_grad()
-    def expected_score(self, logits):  # logits: (B,N,5)
+    def expected_score(self, logits):
         p = F.softmax(logits, dim=-1)
-        return (p * self.bins).sum(dim=-1, keepdim=True)  # (B,N,1)
+        return (p * self.bins).sum(dim=-1, keepdim=True)
+
 
 class RopeEffnetV2s(LightningModule):
     def __init__(self, **kwargs):
@@ -1097,11 +1145,15 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--betas", type=float, nargs="+", default=(0.9, 0.999), help='Betas for Adam optimizer')
         group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=1e-2)
 
-        group.add_argument("--sigma", type=float, default=0.12, help='Sigma for Ordinal EMD Loss')
+        group.add_argument("--sigma", type=float, nargs="+", default=(0.18, 0.12, 0.12, 0.10, 0.07), help='Sigma for Ordinal EMD Loss')
         group.add_argument("--bins", type=float, nargs="+", default=(0.0, 0.25, 0.5, 0.75, 1.0), help='Bins for Ordinal EMD Loss')
         group.add_argument("--class_weights", type=float, nargs="+", default=[0.03603907, 0.14391553, 0.85467111, 1.73506923, 2.23030506], help='Class weights for Ordinal EMD Loss')
         group.add_argument("--bin_weights", type=float, nargs="+", default=[0.23809524, 0.47619048, 0.71428571, 1.19047619, 2.38095238], help='Bin weights for Ordinal EMD Loss')
         group.add_argument("--num_classes", type=int, default=5, help='Output channels for projection head')
+
+        group.add_argument("--top_aux_weight", type=float, default=0.1, help='Weight for auxiliary loss on top class')
+        group.add_argument("--top_pos_weight", type=float, default=7.0, help='Positive weight for auxiliary loss on top class')
+        group.add_argument("--top_aux_warmup_steps", type=int, default=2000, help='Number of warmup steps for auxiliary loss on top class')
         
         # Image Encoder parameters 
         group.add_argument("--spatial_dims", type=int, default=2, help='Spatial dimensions for the encoder')
@@ -1131,6 +1183,46 @@ class RopeEffnetV2s(LightningModule):
         # print("Number of zeros in X_hat:", (X_hat == 0).sum().item())
         
         loss = self.loss_fn(X_hat, y=Y_s.float(), y_class=Y_c)
+
+
+         # aux top-bin loss (apply SAME mask)
+        if self.hparams.top_aux_weight > 0.0 and Y_c is not None and step == "train":
+            C = self.hparams.num_classes
+
+            logits = X_hat
+            y_class = Y_c
+
+            # flatten
+            logits_f = logits.reshape(-1, C)
+            y_class_f = y_class.reshape(-1)
+
+            is_top = (y_class_f == (C - 1)).float()
+
+            pos_w = torch.tensor(self.hparams.top_pos_weight, device=logits_f.device, dtype=logits_f.dtype)            
+
+            logit_top = logits_f[:, -1]
+            logit_rest = torch.logsumexp(logits_f[:, :-1], dim=1)
+            margin = logit_top - logit_rest
+            aux = F.binary_cross_entropy_with_logits(margin, is_top, reduction="none", pos_weight=pos_w)
+
+            aux_mean = aux.mean()
+
+            if self.hparams.top_aux_warmup_steps > 0:
+                warm = min(1.0, float(self.global_step) / float(self.hparams.top_aux_warmup_steps))
+                aux_w = self.hparams.top_aux_weight * warm
+            else:
+                aux_w = self.hparams.top_aux_weight
+
+            loss = loss + aux_w * aux_mean
+            self.log(f"{step}_aux_loss", aux_mean, sync_dist=sync_dist)
+
+            with torch.no_grad():
+                self.log(f"{step}_top_rate", is_top.mean(), sync_dist=sync_dist)
+                self.log(f"{step}_margin_mean", margin.mean(), sync_dist=sync_dist)
+                if is_top.any():
+                    self.log(f"{step}_margin_pos_mean", margin[is_top.bool()].mean(), sync_dist=sync_dist)
+                self.log(f"{step}_margin_neg_mean", margin[~is_top.bool()].mean(), sync_dist=sync_dist)
+
         self.log(f"{step}_loss", loss, sync_dist=sync_dist)
 
         return loss
@@ -1172,25 +1264,28 @@ class RopeEffnetV2s(LightningModule):
         confmat  = self.conf.compute()
 
         if self.trainer.is_global_zero:
-            fig_cm = plt.figure()
-            plt.imshow(confmat.cpu().numpy(), interpolation='nearest')
-            plt.title("Confusion Matrix")
-            plt.xlabel("Predicted")
-            plt.ylabel("True")
-            plt.colorbar()
-            plt.tight_layout()
+            logger = self.trainer.logger
+            run = logger.experiment  
+            
+            experiment = None
+            if isinstance(logger, NeptuneLogger):
+                experiment = run["images/val_confusion_matrix"]
+                
+            out_path = None
+            if os.path.exists(self.hparams.out):
+                out_path = os.path.join(self.hparams.out, "val_confusion_matrix.png")
+                    
+            plot_confusion_matrix(confmat.cpu().numpy(), np.arange(self.hparams.num_classes), experiment=experiment, out_path=out_path)
 
-            if isinstance(self.trainer.logger, NeptuneLogger):
-                self.trainer.logger.experiment["images/val_Confusion_Matrix"].upload(fig_cm)
-            else:
-                out_path = None
-                out_path =  os.path.join(self.hparams.out, "val_confusion_matrix.png")
-                if not os.path.exists(self.hparams.out):
-                    os.makedirs(self.hparams.out)
-                plt.savefig(out_path)
-            plt.close(fig_cm)
-
-            print(classification_report(targets.cpu().numpy(), probs.argmax(dim=-1).cpu().numpy(), digits=3))
+            experiment = None
+            if isinstance(logger, NeptuneLogger):
+                experiment = run["reports/val_classification_report"]
+                
+            out_path = None
+            if os.path.exists(self.hparams.out):
+                out_path = os.path.join(self.hparams.out, "val_classification_report.json")
+                    
+            compute_classification_report(targets.cpu().numpy(), probs.argmax(dim=-1).cpu().numpy(), experiment=experiment, out_path=out_path)
 
         self.probs.reset()
         self.targets.reset()
@@ -1220,25 +1315,28 @@ class RopeEffnetV2s(LightningModule):
         confmat  = self.conf.compute()
 
         if self.trainer.is_global_zero:
-            fig_cm = plt.figure()
-            plt.imshow(confmat.cpu().numpy(), interpolation='nearest')
-            plt.title("Confusion Matrix")
-            plt.xlabel("Predicted")
-            plt.ylabel("True")
-            plt.colorbar()
-            plt.tight_layout()
+            logger = self.trainer.logger
+            run = logger.experiment  
+            
+            experiment = None
+            if isinstance(logger, NeptuneLogger):
+                experiment = run["images/test_confusion_matrix"]
+                
+            out_path = None
+            if os.path.exists(self.hparams.out):
+                out_path = os.path.join(self.hparams.out, "test_confusion_matrix.png")
+                    
+            plot_confusion_matrix(confmat.cpu().numpy(), np.arange(self.hparams.num_classes), experiment=experiment, out_path=out_path)
 
-            if isinstance(self.trainer.logger, NeptuneLogger):
-                self.trainer.logger.experiment["images/test_Confusion_Matrix"].upload(fig_cm)
-            else:
-                out_path = None
-                out_path =  os.path.join(self.hparams.out, "test_confusion_matrix.png")
-                if not os.path.exists(self.hparams.out):
-                    os.makedirs(self.hparams.out)
-                plt.savefig(out_path)
-            plt.close(fig_cm)
-
-            print(classification_report(targets.cpu().numpy(), probs.argmax(dim=-1).cpu().numpy(), digits=3))
+            experiment = None
+            if isinstance(logger, NeptuneLogger):
+                experiment = run["reports/test_classification_report"]
+                
+            out_path = None
+            if os.path.exists(self.hparams.out):
+                out_path = os.path.join(self.hparams.out, "test_classification_report.json")
+                    
+            compute_classification_report(targets.cpu().numpy(), probs.argmax(dim=-1).cpu().numpy(), experiment=experiment, out_path=out_path)
 
         self.probs.reset()
         self.targets.reset()
