@@ -38,19 +38,22 @@ def main(args):
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.out,
-        filename='{epoch}-{' + args.monitor + ':.2f}',
+        filename='{epoch}-{' + args.monitor + ':.3f}',
         save_top_k=2,
         monitor=args.monitor,
         save_last=True
         
     )
 
+    early_stop_callback = EarlyStopping(monitor=args.monitor, min_delta=0.00, patience=args.patience, verbose=True, mode="min")
+
     callbacks.append(checkpoint_callback)
+    callbacks.append(early_stop_callback)
 
     if args.monitor_additional:
         checkpoint_callback_d = ModelCheckpoint(
             dirpath=args.out,
-            filename='{epoch}-{' + args.monitor_additional + ':.2f}',
+            filename='{epoch}-{' + args.monitor_additional + ':.3f}',
             save_top_k=5,
             monitor=args.monitor_additional,
             save_last=True
@@ -114,7 +117,7 @@ if __name__ == '__main__':
     
     output_group = parser.add_argument_group('Output')
     output_group.add_argument('--out', help='Output directory', type=str, default="./")
-    output_group.add_argument('--monitor', help='Additional metric to monitor to save checkpoints', type=str, default="val_loss")
+    output_group.add_argument('--monitor', help='Metric to monitor to save checkpoints', type=str, default="val_loss")
     output_group.add_argument('--monitor_additional', help='Additional metric to monitor to save checkpoints', type=str, default=None)
     
     log_group = parser.add_argument_group('Logging')

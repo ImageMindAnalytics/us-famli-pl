@@ -1136,6 +1136,16 @@ class RopeEffnetV2s(LightningModule):
         self.probs = CatMetric()
         self.targets = CatMetric()
 
+        # Recall for class 4 (multiclass)
+        self.val_recall = torchmetrics.classification.MulticlassRecall(
+            num_classes=self.hparams.num_classes,
+            average=None,        # returns per-class recall
+        )
+
+        # For FP rate on reject at threshold
+        self.val_fp0 = torchmetrics.classification.BinaryStatScores(threshold=0.5)
+        # returns (tp, fp, tn, fn) aggregated across GPUs
+
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -1239,57 +1249,113 @@ class RopeEffnetV2s(LightningModule):
         return self.compute_loss(Y_s=Y_s, Y_c=Y_c, X_hat=x_hat, step="train")
 
     def validation_step(self, val_batch, batch_idx):
-        
-        X = val_batch["img"]
-        Y_s = val_batch["scalar"]
-        Y_c = val_batch["class"]
+        X = val_batch["img"]       # (B,C,T,H,W) presumably
+        Y_s = val_batch["scalar"]  # (B,T) or (B,N) float scores
+        Y_c = val_batch["class"]   # (B,T) int 0..C-1
 
-        X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
+        X = X.permute(0, 2, 1, 3, 4)  # -> (B,T,C,H,W)
+        logits = self(X)             # (B,T,C)
 
-        x_hat = self(X)
+        bins = logits.new_tensor(self.hparams.bins)  # (C,)
 
-        self.compute_loss(Y_s=Y_s, Y_c=Y_c, X_hat=x_hat, step="val", sync_dist=True)
+        # expected score in [0,1]
+        p = torch.softmax(logits, dim=-1)
+        score_pred = (p * bins).sum(dim=-1)          # (B,T)
 
-        Y_c = Y_c.view(-1)
-        x_hat = x_hat.view(-1, self.hparams.num_classes)
-        
-        self.probs.update(x_hat.softmax(dim=-1))
-        self.targets.update(Y_c)
-        self.conf.update(x_hat, Y_c)
+        # nearest-bin predicted class
+        pred_cls = torch.argmin(torch.abs(score_pred[..., None] - bins), dim=-1)  # (B,T)
+
+        # true class: use Y_c directly (safer than Y_s->bins mapping)
+        true_cls = Y_c  # (B,T)
+
+        # flatten for metrics
+        pred_cls_f = pred_cls.reshape(-1)
+        true_cls_f = true_cls.reshape(-1)
+        score_pred_f = score_pred.reshape(-1)
+
+        # --- class-4 recall ---
+        self.val_recall.update(pred_cls_f, true_cls_f)
+
+        # --- reject FP @ thresh ---
+        thresh = getattr(self.hparams, "reject_fp_thresh", 0.5)
+        target_bin = (true_cls_f != 0).int()              # 0=reject, 1=non-reject
+        pred_pos = (score_pred_f >= thresh).int()         # 1=pred non-reject
+        self.val_fp0.update(pred_pos, target_bin)
+
+        # your existing metrics
+        logits_f = logits.reshape(-1, self.hparams.num_classes)
+        y_f = Y_c.reshape(-1)
+
+        self.probs.update(logits_f.softmax(dim=-1))
+        self.targets.update(y_f)
+        self.conf.update(logits_f, y_f)
+
         
     def on_validation_epoch_end(self):
+        rec_per_class = self.val_recall.compute()   # (C,)
+        rec4 = rec_per_class[4]
+
         
+        bss = self.val_fp0.compute()  # bss (Tensor): A tensor of shape (..., 5), where the last dimension corresponds to [tp, fp, tn, fn, sup]
+        fp = bss[1]
+        tn = bss[2]
+        fp0_05 = fp / (fp + tn + 1e-8)
+
+        lam = getattr(self.hparams, "earlystop_fp_lambda", 0.25)
+        val_select = rec4 - lam * fp0_05
+
+        # These are already globally aggregated by torchmetrics
+        self.log("val_rec4", rec4, prog_bar=True, sync_dist=True)
+        self.log("val_fp05_reject", fp0_05, prog_bar=True, sync_dist=True)
+        self.log("val_select", val_select, prog_bar=True, sync_dist=True)
+
+        self.val_recall.reset()
+        self.val_fp0.reset()
+
+        # the rest of your confusion matrix/report code is fine
         probs = self.probs.compute()
         targets = self.targets.compute()
-        confmat  = self.conf.compute()
+        confmat = self.conf.compute()
 
         if self.trainer.is_global_zero:
             logger = self.trainer.logger
-            run = logger.experiment  
-            
+            run = logger.experiment
+
             experiment = None
             if isinstance(logger, NeptuneLogger):
                 experiment = run["images/val_confusion_matrix"]
-                
+
             out_path = None
             if os.path.exists(self.hparams.out):
                 out_path = os.path.join(self.hparams.out, "val_confusion_matrix.png")
-                    
-            plot_confusion_matrix(confmat.cpu().numpy(), np.arange(self.hparams.num_classes), experiment=experiment, out_path=out_path)
+
+            plot_confusion_matrix(
+                confmat.cpu().numpy(),
+                np.arange(self.hparams.num_classes),
+                experiment=experiment,
+                out_path=out_path
+            )
 
             experiment = None
             if isinstance(logger, NeptuneLogger):
                 experiment = run["reports/val_classification_report"]
-                
+
             out_path = None
             if os.path.exists(self.hparams.out):
                 out_path = os.path.join(self.hparams.out, "val_classification_report.json")
-                    
-            compute_classification_report(targets.cpu().numpy(), probs.argmax(dim=-1).cpu().numpy(), experiment=experiment, out_path=out_path)
+
+            compute_classification_report(
+                targets.cpu().numpy(),
+                probs.argmax(dim=-1).cpu().numpy(),
+                experiment=experiment,
+                out_path=out_path
+            )
 
         self.probs.reset()
         self.targets.reset()
         self.conf.reset()
+
+
 
     def test_step(self, test_batch, batch_idx):
         X = test_batch["img"]
