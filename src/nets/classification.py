@@ -1305,9 +1305,9 @@ class RopeEffnetV2s(LightningModule):
         val_select = rec4 - lam * fp0_05
 
         # These are already globally aggregated by torchmetrics
-        self.log("val_rec4", rec4, prog_bar=True, sync_dist=True)
-        self.log("val_fp05_reject", fp0_05, prog_bar=True, sync_dist=True)
-        self.log("val_select", val_select, prog_bar=True, sync_dist=True)
+        self.log("val_rec4", rec4, prog_bar=True, sync_dist=False)
+        self.log("val_fp05_reject", fp0_05, prog_bar=True, sync_dist=False)
+        self.log("val_select", val_select, prog_bar=True, sync_dist=False)
 
         self.val_recall.reset()
         self.val_fp0.reset()
