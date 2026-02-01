@@ -1142,8 +1142,13 @@ class RopeEffnetV2s(LightningModule):
             average=None,        # returns per-class recall
         )
 
-        # For FP rate on reject at threshold
-        self.val_fp0 = torchmetrics.classification.BinaryStatScores(threshold=0.5)
+        # measurable detection: target = 1 if true in {3,4}, pred = 1 if score_pred >= 0.75
+        self.val_meas_stats = torchmetrics.classification.BinaryStatScores(threshold=0.5)  
+        # (threshold irrelevant since we pass int preds, but torchmetrics requires one)
+
+        # reject false positives at two thresholds (0.75 and 0.9)
+        self.val_reject_fp75 = torchmetrics.classification.BinaryStatScores(threshold=0.75)
+        self.val_reject_fp90 = torchmetrics.classification.BinaryStatScores(threshold=0.90)
         # returns (tp, fp, tn, fn) aggregated across GPUs
 
 
@@ -1164,6 +1169,10 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--top_aux_weight", type=float, default=0.1, help='Weight for auxiliary loss on top class')
         group.add_argument("--top_pos_weight", type=float, default=7.0, help='Positive weight for auxiliary loss on top class')
         group.add_argument("--top_aux_warmup_steps", type=int, default=2000, help='Number of warmup steps for auxiliary loss on top class')
+
+        group.add_argument("--meas_thresh", type=float, default=0.75)
+        group.add_argument("--earlystop_fp_lambda", type=float, default=0.25)
+        group.add_argument("--earlystop_fp_tail_lambda", type=float, default=1.0)
         
         # Image Encoder parameters 
         group.add_argument("--spatial_dims", type=int, default=2, help='Spatial dimensions for the encoder')
@@ -1273,16 +1282,26 @@ class RopeEffnetV2s(LightningModule):
         true_cls_f = true_cls.reshape(-1)
         score_pred_f = score_pred.reshape(-1)
 
-        # --- class-4 recall ---
-        self.val_recall.update(pred_cls_f, true_cls_f)
+        # -------------------------
+        # (A) measurable recall
+        # -------------------------
+        is_meas = (true_cls_f >= 3).int()  # classes 3,4
+        pred_meas = (score_pred_f >= self.hparams.meas_thresh).int()
+        self.val_meas_stats.update(pred_meas, is_meas)
 
-        # --- reject FP @ thresh ---
-        thresh = getattr(self.hparams, "reject_fp_thresh", 0.5)
-        target_bin = (true_cls_f != 0).int()              # 0=reject, 1=non-reject
-        pred_pos = (score_pred_f >= thresh).int()         # 1=pred non-reject
-        self.val_fp0.update(pred_pos, target_bin)
+        # -------------------------
+        # (B) reject FP at 0.75/0.9
+        # target_bin: 0=reject, 1=non-reject
+        # pred_pos: predicted non-reject by thresholding score_pred
+        # FP/(FP+TN) computed at epoch end is P(pred_pos=1 | target_bin=0)
+        # -------------------------
+        target_nonreject = (true_cls_f != 0).int()
+        self.val_reject_fp75.update((score_pred_f >= 0.75).int(), target_nonreject)
+        self.val_reject_fp90.update((score_pred_f >= 0.90).int(), target_nonreject)
 
-        # your existing metrics
+        
+
+        # for cm
         logits_f = logits.reshape(-1, self.hparams.num_classes)
         y_f = Y_c.reshape(-1)
 
@@ -1290,29 +1309,55 @@ class RopeEffnetV2s(LightningModule):
         self.targets.update(y_f)
         self.conf.update(logits_f, y_f)
 
+    def _unpack_bss(self, bss):
+        """
+        Torchmetrics BinaryStatScores compute() can return:
+        - tuple(tp, fp, tn, fn)  (older)
+        - tensor([tp, fp, tn, fn, sup]) or shape (...,5) (newer)
+        Returns: tp, fp, tn, fn as scalars/tensors
+        """
+        if isinstance(bss, (tuple, list)):
+            tp, fp, tn, fn = bss[:4]
+            return tp, fp, tn, fn
+
+        # tensor output
+        # last dim is [tp, fp, tn, fn, sup]
+        tp = bss[..., 0]
+        fp = bss[..., 1]
+        tn = bss[..., 2]
+        fn = bss[..., 3]
+        return tp, fp, tn, fn
         
     def on_validation_epoch_end(self):
-        rec_per_class = self.val_recall.compute()   # (C,)
-        rec4 = rec_per_class[4]
+        # measurable recall = TP / (TP + FN)
+        bss = self.val_meas_stats.compute()
+        tp, fp, tn, fn = self._unpack_bss(bss)
+        recall_meas = tp / (tp + fn + 1e-8)
 
-        
-        bss = self.val_fp0.compute()  # bss (Tensor): A tensor of shape (..., 5), where the last dimension corresponds to [tp, fp, tn, fn, sup]
-        fp = bss[1]
-        tn = bss[2]
-        fp0_05 = fp / (fp + tn + 1e-8)
+        # reject FP@0.75 = FP / (FP + TN) in the nonreject-vs-reject binary framing
+        bss75 = self.val_reject_fp75.compute()
+        tp, fp, tn, fn = self._unpack_bss(bss75)
+        fp_reject_075 = fp / (fp + tn + 1e-8)
+
+        bss90 = self.val_reject_fp90.compute()
+        tp, fp, tn, fn = self._unpack_bss(bss90)
+        fp_reject_090 = fp / (fp + tn + 1e-8)
 
         lam = getattr(self.hparams, "earlystop_fp_lambda", 0.25)
-        val_select = rec4 - lam * fp0_05
+        mu  = getattr(self.hparams, "earlystop_fp_tail_lambda", 1.0)
 
-        # These are already globally aggregated by torchmetrics
-        self.log("val_rec4", rec4, prog_bar=True, sync_dist=False)
-        self.log("val_fp05_reject", fp0_05, prog_bar=True, sync_dist=False)
-        self.log("val_select", val_select, prog_bar=True, sync_dist=False)
+        val_select = recall_meas - lam * fp_reject_075 - mu * fp_reject_090
 
-        self.val_recall.reset()
-        self.val_fp0.reset()
+        self.log("val_recall_meas", recall_meas, prog_bar=True)
+        self.log("val_fp_reject_075", fp_reject_075, prog_bar=True)
+        self.log("val_fp_reject_090", fp_reject_090, prog_bar=True)
+        self.log("val_select", val_select, prog_bar=True)
 
-        # the rest of your confusion matrix/report code is fine
+        self.val_meas_stats.reset()
+        self.val_reject_fp75.reset()
+        self.val_reject_fp90.reset()
+
+        # confusion matrix/report 
         probs = self.probs.compute()
         targets = self.targets.compute()
         confmat = self.conf.compute()
