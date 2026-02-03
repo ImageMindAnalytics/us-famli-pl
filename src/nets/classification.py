@@ -807,6 +807,13 @@ def temporal_tv(x, power=1):
         return d.abs().mean()
     return (d * d).mean()
 
+def derivative_match_loss(s, y, power=1):
+    # s: (B,T), y: (B,T)
+    ds = s[:, 1:] - s[:, :-1]
+    dy = y[:, 1:] - y[:, :-1]
+    d = ds - dy
+    return d.abs().mean() if power == 1 else (d * d).mean()
+
 class RopeEffnetV2s(LightningModule):
     def __init__(self, **kwargs):
         super().__init__()
@@ -881,7 +888,10 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--reject_tau", type=float, default=0.85, help='Reject tail threshold')
 
         group.add_argument("--temporal_score_tv_power", type=int, default=1, help='Power for temporal total variation regularization on expected score')
-        group.add_argument("--temporal_score_tv_weight", type=float, default=0.05, help='Weight for temporal total variation regularization on expected score')
+        group.add_argument("--temporal_score_tv_weight", type=float, default=0.00, help='Weight for temporal total variation regularization on expected score')
+
+        group.add_argument("--temporal_derivative_weight", type=float, default=0.02, help='Weight for temporal derivative matching loss on expected score')
+        group.add_argument("--temporal_derivative_power", type=int, default=1, help='Power for temporal derivative matching loss on expected score')
         
         group.add_argument("--meas_thresh", type=float, default=0.75)
         group.add_argument("--earlystop_fp_lambda", type=float, default=0.25)
@@ -974,7 +984,13 @@ class RopeEffnetV2s(LightningModule):
             # s = expected_score_from_logits(logits, self.loss_fn.bins)  # (B,T)
             tv_s = temporal_tv(logits, power=getattr(self.hparams, "temporal_score_tv_power", 1))
             loss = loss + self.hparams.temporal_score_tv_weight * tv_s
-            self.log(f"{step}_tv_score", tv_s, sync_dist=sync_dist)    
+            self.log(f"{step}_tv_score", tv_s, sync_dist=sync_dist)  
+
+        if getattr(self.hparams, "temporal_derivative_weight", 0.0) > 0 and step == "train":
+            s = expected_score_from_logits(logits, self.loss_fn.bins)  # (B,T)
+            dml = derivative_match_loss(s, Y_s.float(), power=getattr(self.hparams, "temporal_derivative_power", 1))
+            loss = loss + self.hparams.temporal_derivative_weight * dml
+            self.log(f"{step}_derivative_match_loss", dml, sync_dist=sync_dist)    
 
         self.log(f"{step}_loss", loss, sync_dist=sync_dist)
 
