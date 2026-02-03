@@ -795,6 +795,17 @@ class OrdinalEMDLoss(nn.Module):
         p = F.softmax(logits, dim=-1)
         return (p * self.bins).sum(dim=-1, keepdim=True)
 
+def expected_score_from_logits(logits, bins):
+    # logits: (B,T,C), bins: (C,)
+    p = torch.softmax(logits, dim=-1)
+    return (p * bins.view(1, 1, -1)).sum(dim=-1)  # (B,T)
+
+def temporal_tv(x, power=1):
+    # x: (B,T)
+    d = x[:, 1:] - x[:, :-1]
+    if power == 1:
+        return d.abs().mean()
+    return (d * d).mean()
 
 class RopeEffnetV2s(LightningModule):
     def __init__(self, **kwargs):
@@ -869,6 +880,9 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--reject_tail_weight", type=float, default=0.05, help='Weight for reject tail penalty')
         group.add_argument("--reject_tau", type=float, default=0.85, help='Reject tail threshold')
 
+        group.add_argument("--temporal_score_tv_power", type=int, default=1, help='Power for temporal total variation regularization on expected score')
+        group.add_argument("--temporal_score_tv_weight", type=float, default=0.10, help='Weight for temporal total variation regularization on expected score')
+        
         group.add_argument("--meas_thresh", type=float, default=0.75)
         group.add_argument("--earlystop_fp_lambda", type=float, default=0.25)
         group.add_argument("--earlystop_fp_tail_lambda", type=float, default=1.0)
@@ -956,7 +970,11 @@ class RopeEffnetV2s(LightningModule):
 
             self.log(f"{step}_reject_tail", reject_tail, sync_dist=sync_dist)
 
-            
+        if getattr(self.hparams, "temporal_score_tv_weight", 0.0) > 0 and step == "train":
+            s = expected_score_from_logits(logits, self.hparams.bins)  # (B,T)
+            tv_s = temporal_tv(s, power=getattr(self.hparams, "temporal_score_tv_power", 1))
+            loss = loss + self.hparams.temporal_score_tv_weight * tv_s
+            self.log(f"{step}_tv_score", tv_s, sync_dist=sync_dist)    
 
         self.log(f"{step}_loss", loss, sync_dist=sync_dist)
 
