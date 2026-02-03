@@ -1001,11 +1001,12 @@ class USDataModuleBlindSweepWTag(LightningDataModule):
 
 
 class USAnnotatedBlindSweep(Dataset):
-    def __init__(self, df, mount_point = "./", img_column='file_path', tag_column='tag', frame_column="frame_index", id_column='annotation_id', num_frames=64, transform=None, frame_label=None, frame_label_dict=None, scalar_label=None, scalar_label_dict=None, sample_balanced=False):
+    def __init__(self, df, mount_point = "./", img_column='file_path', tag_column='tag', frame_column="frame_index", id_column='annotation_id', num_frames=64, max_frames=0, transform=None, frame_label=None, frame_label_dict=None, scalar_label=None, scalar_label_dict=None, sample_balanced=False):
         
         self.df_frames = df        
         self.mount_point = mount_point
-        self.num_frames = num_frames        
+        self.num_frames = num_frames
+        self.max_frames = max_frames        
         self.img_column = img_column
         self.id_column = id_column
         self.tag_column = tag_column        
@@ -1129,6 +1130,22 @@ class USAnnotatedBlindSweep(Dataset):
                         img_scalar_t = ret_d["scalar"]
                         img_scalar_t = img_scalar_t[idx].contiguous()
                         ret_d["scalar"] = img_scalar_t
+
+            if self.max_frames > 0 and img_t.shape[0] > self.max_frames:
+                idx = torch.randperm(img_t.shape[0])[:self.max_frames]
+                idx = idx.sort().values
+
+                img_t = img_t[idx].contiguous()
+
+                if "class" in ret_d:
+                    img_labels_t = ret_d["class"]
+                    img_labels_t = img_labels_t[idx].contiguous()
+                    ret_d["class"] = img_labels_t.long()
+                
+                if "scalar" in ret_d:
+                    img_scalar_t = ret_d["scalar"]
+                    img_scalar_t = img_scalar_t[idx].contiguous()
+                    ret_d["scalar"] = img_scalar_t
                     
 
             img_t = img_t.unsqueeze(0).repeat(3,1,1,1).contiguous()
@@ -1191,7 +1208,8 @@ class USAnnotatedBlindSweepDataModule(LightningDataModule):
         group.add_argument('--sample_balanced', type=int, default=0, help="Whether to sample balanced batches")
         group.add_argument('--id_column', type=str, default="annotation_id")
         group.add_argument('--batch_size', type=int, default=4, help="Batch size for the train dataloaders")
-        group.add_argument('--num_frames', type=int, default=64, help="Number of frames to sample from each cine")
+        group.add_argument('--num_frames', type=int, default=64, help="Number of frames to sample from each cine, ensures num_frames per cine")
+        group.add_argument('--max_frames', type=int, default=0, help="Sample up to max_frames per cine, if 0 sample all frames")
         group.add_argument('--num_workers', type=int, default=1)
         group.add_argument('--prefetch_factor', type=int, default=2)
         group.add_argument('--drop_last', type=bool, default=False)
@@ -1200,7 +1218,7 @@ class USAnnotatedBlindSweepDataModule(LightningDataModule):
 
     def setup(self, stage=None):
         # Assign train/val datasets for use in dataloaders        
-        self.train_ds = USAnnotatedBlindSweep(self.df_train, self.hparams.mount_point, img_column=self.hparams.img_column, tag_column=self.hparams.tag_column, frame_column=self.hparams.frame_column, frame_label=self.hparams.frame_label, id_column=self.hparams.id_column, num_frames=self.hparams.num_frames, transform=self.train_transform, frame_label_dict=self.frame_label_dict, scalar_label=self.hparams.scalar_label, scalar_label_dict=self.scalar_label_dict, sample_balanced=self.hparams.sample_balanced)
+        self.train_ds = USAnnotatedBlindSweep(self.df_train, self.hparams.mount_point, img_column=self.hparams.img_column, tag_column=self.hparams.tag_column, frame_column=self.hparams.frame_column, frame_label=self.hparams.frame_label, id_column=self.hparams.id_column, num_frames=self.hparams.num_frames, max_frames=self.hparams.max_frames, transform=self.train_transform, frame_label_dict=self.frame_label_dict, scalar_label=self.hparams.scalar_label, scalar_label_dict=self.scalar_label_dict, sample_balanced=self.hparams.sample_balanced)
         self.val_ds = USAnnotatedBlindSweep(self.df_valid, self.hparams.mount_point, img_column=self.hparams.img_column, tag_column=self.hparams.tag_column, frame_column=self.hparams.frame_column, frame_label=self.hparams.frame_label, id_column=self.hparams.id_column, num_frames=-1, transform=self.valid_transform, frame_label_dict=self.frame_label_dict, scalar_label=self.hparams.scalar_label, scalar_label_dict=self.scalar_label_dict)
         self.test_ds = USAnnotatedBlindSweep(self.df_test, self.hparams.mount_point, img_column=self.hparams.img_column, tag_column=self.hparams.tag_column, frame_column=self.hparams.frame_column, frame_label=self.hparams.frame_label, id_column=self.hparams.id_column, num_frames=-1, transform=self.test_transform, frame_label_dict=self.frame_label_dict, scalar_label=self.hparams.scalar_label, scalar_label_dict=self.scalar_label_dict)
 
