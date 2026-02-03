@@ -866,6 +866,9 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--top_pos_weight", type=float, default=7.0, help='Positive weight for auxiliary loss on top class')
         group.add_argument("--top_aux_warmup_steps", type=int, default=2000, help='Number of warmup steps for auxiliary loss on top class')
 
+        group.add_argument("--reject_tail_weight", type=float, default=0.05, help='Weight for reject tail penalty')
+        group.add_argument("--reject_tau", type=float, default=0.85, help='Reject tail threshold')
+
         group.add_argument("--meas_thresh", type=float, default=0.75)
         group.add_argument("--earlystop_fp_lambda", type=float, default=0.25)
         group.add_argument("--earlystop_fp_tail_lambda", type=float, default=1.0)
@@ -899,21 +902,19 @@ class RopeEffnetV2s(LightningModule):
         
         loss = self.loss_fn(X_hat, y=Y_s.float(), y_class=Y_c)
 
+        C = self.hparams.num_classes
+        logits = X_hat
+        logits_f = logits.reshape(-1, C)
 
-         # aux top-bin loss (apply SAME mask)
-        if self.hparams.top_aux_weight > 0.0 and Y_c is not None and step == "train":
-            C = self.hparams.num_classes
-
-            logits = X_hat
+        if(Y_c is not None):
             y_class = Y_c
-
-            # flatten
-            logits_f = logits.reshape(-1, C)
             y_class_f = y_class.reshape(-1)
+
+        if self.hparams.top_aux_weight > 0.0 and Y_c is not None and step == "train":
 
             is_top = (y_class_f == (C - 1)).float()
 
-            pos_w = torch.tensor(self.hparams.top_pos_weight, device=logits_f.device, dtype=logits_f.dtype)            
+            pos_w = logits_f.new_tensor(float(self.hparams.top_pos_weight))
 
             logit_top = logits_f[:, -1]
             logit_rest = torch.logsumexp(logits_f[:, :-1], dim=1)
@@ -934,9 +935,28 @@ class RopeEffnetV2s(LightningModule):
             with torch.no_grad():
                 self.log(f"{step}_top_rate", is_top.mean(), sync_dist=sync_dist)
                 self.log(f"{step}_margin_mean", margin.mean(), sync_dist=sync_dist)
-                if is_top.any():
+                if is_top.bool().any():
                     self.log(f"{step}_margin_pos_mean", margin[is_top.bool()].mean(), sync_dist=sync_dist)
                 self.log(f"{step}_margin_neg_mean", margin[~is_top.bool()].mean(), sync_dist=sync_dist)
+
+        if self.hparams.reject_tail_weight > 0.0 and Y_c is not None and step == "train":
+
+            # Reject tail penalty
+            # after logits_f and y_class_f
+            bins = logits_f.new_tensor(self.hparams.bins)
+            p = torch.softmax(logits_f, dim=1)
+            score_pred_f = (p * bins).sum(dim=1)
+
+            is_reject = (y_class_f == 0)
+
+            reject_tail = logits_f.new_zeros(())
+            if is_reject.any():
+                reject_tail = torch.relu(score_pred_f[is_reject] - self.hparams.reject_tau).mean()
+                loss = loss + self.hparams.reject_tail_weight * reject_tail
+
+            self.log(f"{step}_reject_tail", reject_tail, sync_dist=sync_dist)
+
+            
 
         self.log(f"{step}_loss", loss, sync_dist=sync_dist)
 
