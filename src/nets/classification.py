@@ -891,6 +891,7 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--temporal_score_tv_weight", type=float, default=0.00, help='Weight for temporal total variation regularization on expected score')
 
         group.add_argument("--temporal_derivative_weight", type=float, default=0.02, help='Weight for temporal derivative matching loss on expected score')
+        group.add_argument("--temporal_derivative_warmup_steps", nargs="+", type=int, default=[10000, 20000], help='Number of warmup steps for temporal derivative matching loss on expected score')
         group.add_argument("--temporal_derivative_power", type=int, default=1, help='Power for temporal derivative matching loss on expected score')
         
         group.add_argument("--meas_thresh", type=float, default=0.75)
@@ -988,8 +989,11 @@ class RopeEffnetV2s(LightningModule):
 
         if getattr(self.hparams, "temporal_derivative_weight", 0.0) > 0 and step == "train":
             s = expected_score_from_logits(logits, self.loss_fn.bins)  # (B,T)
-            dml = derivative_match_loss(s, Y_s.float(), power=getattr(self.hparams, "temporal_derivative_power", 1))
-            loss = loss + self.hparams.temporal_derivative_weight * dml
+            warm = 0.0
+            if self.hparams.temporal_derivative_warmup_steps[0] <= self.global_step:
+                warm = min(1.0, float(self.global_step - self.hparams.temporal_derivative_warmup_steps[0]) / float(self.hparams.temporal_derivative_warmup_steps[1] - self.hparams.temporal_derivative_warmup_steps[0]))
+            dml = warm * self.hparams.temporal_derivative_weight * derivative_match_loss(s, Y_s.float(), power=getattr(self.hparams, "temporal_derivative_power", 1))            
+            loss = loss + dml
             self.log(f"{step}_derivative_match_loss", dml, sync_dist=sync_dist)    
 
         self.log(f"{step}_loss", loss, sync_dist=sync_dist)
