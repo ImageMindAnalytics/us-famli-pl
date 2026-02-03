@@ -877,7 +877,7 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--top_pos_weight", type=float, default=7.0, help='Positive weight for auxiliary loss on top class')
         group.add_argument("--top_aux_warmup_steps", type=int, default=2000, help='Number of warmup steps for auxiliary loss on top class')
 
-        group.add_argument("--reject_tail_weight", type=float, default=0.05, help='Weight for reject tail penalty')
+        group.add_argument("--reject_tail_weight", type=float, default=0.00, help='Weight for reject tail penalty')
         group.add_argument("--reject_tau", type=float, default=0.85, help='Reject tail threshold')
 
         group.add_argument("--temporal_score_tv_power", type=int, default=1, help='Power for temporal total variation regularization on expected score')
@@ -971,7 +971,7 @@ class RopeEffnetV2s(LightningModule):
             self.log(f"{step}_reject_tail", reject_tail, sync_dist=sync_dist)
 
         if getattr(self.hparams, "temporal_score_tv_weight", 0.0) > 0 and step == "train":
-            s = expected_score_from_logits(logits, self.hparams.bins)  # (B,T)
+            s = expected_score_from_logits(logits, self.loss_fn.bins)  # (B,T)
             tv_s = temporal_tv(s, power=getattr(self.hparams, "temporal_score_tv_power", 1))
             loss = loss + self.hparams.temporal_score_tv_weight * tv_s
             self.log(f"{step}_tv_score", tv_s, sync_dist=sync_dist)    
