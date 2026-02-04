@@ -880,7 +880,7 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--bin_weights", type=float, nargs="+", default=[0.23809524, 0.47619048, 0.71428571, 1.19047619, 2.38095238], help='Bin weights for Ordinal EMD Loss')
         group.add_argument("--num_classes", type=int, default=5, help='Output channels for projection head')
 
-        group.add_argument("--top_aux_weight", type=float, default=0.1, help='Weight for auxiliary loss on top class')
+        group.add_argument("--top_aux_weight", type=float, default=0.0, help='Weight for auxiliary loss on top class')
         group.add_argument("--top_pos_weight", type=float, default=7.0, help='Positive weight for auxiliary loss on top class')
         group.add_argument("--top_aux_warmup_steps", type=int, default=2000, help='Number of warmup steps for auxiliary loss on top class')
 
@@ -890,8 +890,8 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--temporal_score_tv_power", type=int, default=1, help='Power for temporal total variation regularization on expected score')
         group.add_argument("--temporal_score_tv_weight", type=float, default=0.00, help='Weight for temporal total variation regularization on expected score')
 
-        group.add_argument("--temporal_derivative_weight", type=float, default=0.02, help='Weight for temporal derivative matching loss on expected score')
-        group.add_argument("--temporal_derivative_warmup_steps", nargs="+", type=int, default=[10000, 20000], help='Number of warmup steps for temporal derivative matching loss on expected score')
+        group.add_argument("--temporal_derivative_weight", type=float, default=0.00, help='Weight for temporal derivative matching loss on expected score')
+        group.add_argument("--temporal_derivative_warmup_steps", nargs="+", type=int, default=[0, 200], help='Number of warmup steps for temporal derivative matching loss on expected score')
         group.add_argument("--temporal_derivative_power", type=int, default=1, help='Power for temporal derivative matching loss on expected score')
         
         group.add_argument("--meas_thresh", type=float, default=0.75)
@@ -944,9 +944,7 @@ class RopeEffnetV2s(LightningModule):
             logit_top = logits_f[:, -1]
             logit_rest = torch.logsumexp(logits_f[:, :-1], dim=1)
             margin = logit_top - logit_rest
-            aux = F.binary_cross_entropy_with_logits(margin, is_top, reduction="none", pos_weight=pos_w)
-
-            aux_mean = aux.mean()
+            aux = F.binary_cross_entropy_with_logits(margin, is_top, reduction="none", pos_weight=pos_w)           
 
             if self.hparams.top_aux_warmup_steps > 0:
                 warm = min(1.0, float(self.global_step) / float(self.hparams.top_aux_warmup_steps))
@@ -954,7 +952,9 @@ class RopeEffnetV2s(LightningModule):
             else:
                 aux_w = self.hparams.top_aux_weight
 
-            loss = loss + aux_w * aux_mean
+            aux_mean = aux.mean() * aux_w
+
+            loss = loss + aux_mean
             self.log(f"{step}_aux_loss", aux_mean, sync_dist=sync_dist)
 
             with torch.no_grad():
