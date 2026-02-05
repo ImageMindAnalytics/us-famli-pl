@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import math
 
 class TimeDistributed(nn.Module):
     def __init__(self, module):
@@ -403,20 +403,34 @@ class MHAContextModulated(nn.Module):
         if self.return_weights:
             return x, attn_output_weights
         return x
+
+    
     
 class MHABlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.1, causal_mask=False, return_weights=False):
+    def __init__(self, embed_dim, num_heads, dropout=0.1, mlp_ratio=4.0, causal_mask=False, return_weights=False):
         super(MHABlock, self).__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.causal_mask = causal_mask
         self.return_weights = return_weights
 
+        self.ln1 = nn.LayerNorm(embed_dim)
+
         self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, bias=False, batch_first=True)
+        
+        self.ln2 = nn.LayerNorm(embed_dim)
+
+        hidden = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, embed_dim),
+            nn.Dropout(dropout),
+        )
 
     def generate_causal_mask(self, seq_len):
         return torch.triu(torch.full((seq_len, seq_len), float("-inf")), diagonal=1)
-
     
     def forward(self, x):
 
@@ -424,10 +438,15 @@ class MHABlock(nn.Module):
         if self.causal_mask:
             mask = self.generate_causal_mask(x.size(1)).to(x.device) 
 
-        x, attn_output_weights = self.attention(x, x, x, attn_mask=mask, is_causal=self.causal_mask)
+        x_ = self.ln1(x)
+        x_, attn_output_weights = self.attention(x_, x_, x_, attn_mask=mask, is_causal=self.causal_mask)
 
         if self.return_weights:
             return x, attn_output_weights
+        
+        x = x + x_
+        x = x + self.mlp(self.ln2(x))
+        
         return x
 
 class MultiheadAttentionBlock(nn.Module):
@@ -532,12 +551,6 @@ class HeteroscedasticHead(nn.Module):
         log_var = self.log_var(h).squeeze(-1)  # [B]
         log_var = torch.clamp(log_var, min=-10.0, max=10.0)  # numerical safety
         return mu, log_var
-
-
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
