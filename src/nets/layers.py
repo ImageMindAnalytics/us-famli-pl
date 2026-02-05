@@ -710,3 +710,32 @@ class RoPETransformerBlock(nn.Module):
         x = x + self.attn(self.ln1(x), key_padding_mask=key_padding_mask, causal=causal)
         x = x + self.mlp(self.ln2(x))
         return x
+
+
+class TemporalRefinerTCN(nn.Module):
+    def __init__(self, in_dim, num_classes, hidden=256, layers=4, k=5, dropout=0.1):
+        super().__init__()
+        mods = []
+        dim = in_dim + num_classes
+        for i in range(layers):
+            dil = 2**i
+            mods += [
+                nn.Conv1d(dim, hidden, kernel_size=k, padding=dil*(k//2), dilation=dil),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ]
+            dim = hidden
+        self.net = nn.Sequential(*mods)
+        self.out = nn.Conv1d(hidden, num_classes, kernel_size=1)
+
+        # start near-identity: output small corrections at init
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, feats, logits):
+        # feats: (B,T,D), logits: (B,T,C)
+        x = torch.cat([feats, logits], dim=-1)  # (B,T,D+C)
+        x = x.transpose(1, 2)                   # (B,D+C,T)
+        h = self.net(x)                         # (B,H,T)
+        dlogits = self.out(h).transpose(1, 2)   # (B,T,C)
+        return logits + dlogits
