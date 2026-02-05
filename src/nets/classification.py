@@ -1,3 +1,4 @@
+from json import encoder
 import torch
 from torch import nn
 import torch.optim as optim
@@ -2004,10 +2005,8 @@ class EffnetV2sTDOEMD(LightningModule):
 class TemporalRefinerEffnetV2s(LightningModule):
     def __init__(self, **kwargs):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters()       
         
-        encoder = torchvision.models.efficientnet_v2_s(weights='IMAGENET1K_V1')
-        encoder.classifier = nn.Linear(self.hparams.features, self.hparams.embed_dim)
 
         if self.hparams.model_freeze:
             effnet = EffnetV2sTDOEMD.load_from_checkpoint(self.hparams.model_freeze, map_location='cpu')
@@ -2017,9 +2016,16 @@ class TemporalRefinerEffnetV2s(LightningModule):
             self.head = effnet.proj
             
         else:
+            encoder = torchvision.models.efficientnet_v2_s(weights='IMAGENET1K_V1')
+            encoder.classifier = nn.Linear(self.hparams.features, self.hparams.embed_dim)
             self.encoder = TimeDistributed(encoder)
+            self.head = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
 
-        self.temporal_refiner = TemporalRefinerTCN(in_dim=self.hparams.embed_dim, num_classes=self.hparams.num_classes, hidden=self.hparams.embed_dim*2, dropout=self.hparams.dropout)   
+        self.rope = RoPETransformerBlock(dim=self.hparams.embed_dim, num_heads=self.hparams.num_heads, mlp_ratio=self.hparams.mlp_ratio, dropout=self.hparams.dropout)
+        self.norm = nn.LayerNorm(self.hparams.embed_dim)
+        self.rope_head = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
+        nn.init.zeros_(self.rope_head.weight)
+        nn.init.zeros_(self.rope_head.bias)
         
 
         self.train_transform = v2.Compose(
@@ -2090,7 +2096,8 @@ class TemporalRefinerEffnetV2s(LightningModule):
         group.add_argument("--betas", type=float, nargs="+", default=(0.9, 0.999), help='Betas for Adam optimizer')
         group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=1e-2)
 
-        group.add_argument("--model_freeze", type=str, default='/mnt/raid/C1_ML_Analysis/train_output/classification/EffnetV2sTDOEMD/v0.2/epoch=15-val_select=0.235.ckpt', help='Path to pretrained EffnetV2sTDOEMD checkpoint to freeze encoder and head')
+        # group.add_argument("--model_freeze", type=str, default='/mnt/raid/C1_ML_Analysis/train_output/classification/EffnetV2sTDOEMD/v0.2/epoch=15-val_select=0.235.ckpt', help='Path to pretrained EffnetV2sTDOEMD checkpoint to freeze encoder and head')
+        group.add_argument("--model_freeze", type=str, default=None, help='Path to pretrained EffnetV2sTDOEMD checkpoint to freeze encoder and head')
 
         group.add_argument("--sigma", type=float, nargs="+", default=(0.16, 0.12, 0.12, 0.1, 0.06), help='Sigma for Ordinal EMD Loss')
         group.add_argument("--bins", type=float, nargs="+", default=(0.0, 0.25, 0.5, 0.75, 1.0), help='Bins for Ordinal EMD Loss')
@@ -2122,6 +2129,7 @@ class TemporalRefinerEffnetV2s(LightningModule):
         group.add_argument("--features", type=int, default=1280, help='Number of output features for the encoder')
         group.add_argument("--embed_dim", type=int, default=128, help='Embedding dimension for the model')
         group.add_argument("--num_heads", type=int, default=8, help='Number of heads for MHA')
+        group.add_argument("--mlp_ratio", type=float, default=4.0, help='MLP ratio for RoPE transformer')
         group.add_argument("--max_seq_len", type=int, default=1000, help='Maximum sequence length for PE')
         group.add_argument("--dropout", type=float, default=0.2, help='Dropout rate')
 
@@ -2134,7 +2142,7 @@ class TemporalRefinerEffnetV2s(LightningModule):
                                 weight_decay=self.hparams.weight_decay)
         return optimizer
     
-    def compute_loss(self, Y_s, X_hat, Y_c=None, step="train", sync_dist=False):
+    def compute_loss(self, Y_s, logits, logits_res, Y_c=None, step="train", sync_dist=False):
 
         # print("Y unique:", torch.unique(Y))
         # print("Y min/max:", Y.min().item(), Y.max().item())
@@ -2142,12 +2150,22 @@ class TemporalRefinerEffnetV2s(LightningModule):
 
         # print("X_hat min/max:", X_hat.min().item(), X_hat.max().item())
         # print("Number of zeros in X_hat:", (X_hat == 0).sum().item())
-        
-        loss = self.loss_fn(X_hat, y=Y_s.float(), y_class=Y_c)
 
-        C = self.hparams.num_classes
-        logits = X_hat
-        logits_f = logits.reshape(-1, C)
+        C = self.hparams.num_classes        
+
+        logits_ctx = logits + logits_res
+
+        loss_ctx = self.loss_fn(logits_ctx, y=Y_s.float(), y_class=Y_c)
+        loss_base = self.loss_fn(logits, y=Y_s.float(), y_class=Y_c)
+
+        p_base = torch.softmax(logits.detach(), dim=-1)
+        p_ctx  = torch.softmax(logits_ctx, dim=-1)
+        loss_kl = F.kl_div(torch.log(p_ctx.clamp_min(1e-8)), p_base, reduction="batchmean")
+        loss_l2 = (logits_res ** 2).mean()
+
+        loss = 1.0 * loss_ctx + 0.2 * loss_base + 0.01 * loss_kl + 3e-4 * loss_l2
+
+        logits_f = logits_ctx.reshape(-1, C)
 
         if(Y_c is not None):
             y_class = Y_c
@@ -2179,7 +2197,7 @@ class TemporalRefinerEffnetV2s(LightningModule):
                 self.log(f"{step}_top_rate", is_top.mean(), sync_dist=sync_dist)
                 self.log(f"{step}_margin_mean", margin.mean(), sync_dist=sync_dist)
                 if is_top.bool().any():
-                    self.log(f"{step}_margin_pos_mean", margin[is_top.bool()].mean(), sync_dist=sync_dist)
+                    self.log(f"{step}_margin_pos_mean", margin[is_top.bool()].mean(), sync_dist=sync_dist) # this must increase during training
                 self.log(f"{step}_margin_neg_mean", margin[~is_top.bool()].mean(), sync_dist=sync_dist)
 
         if self.hparams.reject_tail_weight > 0.0 and Y_c is not None and step == "train":
@@ -2212,9 +2230,14 @@ class TemporalRefinerEffnetV2s(LightningModule):
                 warm = min(1.0, float(self.global_step - self.hparams.temporal_derivative_warmup_steps[0]) / float(self.hparams.temporal_derivative_warmup_steps[1] - self.hparams.temporal_derivative_warmup_steps[0]))
             dml = warm * self.hparams.temporal_derivative_weight * derivative_match_loss(s, Y_s.float(), power=getattr(self.hparams, "temporal_derivative_power", 1))            
             loss = loss + dml
-            self.log(f"{step}_derivative_match_loss", dml, sync_dist=sync_dist)    
+            self.log(f"{step}_derivative_match_loss", dml, sync_dist=sync_dist)                
 
         self.log(f"{step}_loss", loss, sync_dist=sync_dist)
+        self.log(f"{step}_loss_ctx", loss_ctx, sync_dist=sync_dist)
+        self.log(f"{step}_loss_base", loss_base, sync_dist=sync_dist)
+        self.log(f"{step}_loss_kl", loss_kl, sync_dist=sync_dist)
+        self.log(f"{step}_loss_l2", loss_l2, sync_dist=sync_dist)
+
 
         return loss
 
@@ -2224,10 +2247,16 @@ class TemporalRefinerEffnetV2s(LightningModule):
         Y_c = train_batch["class"]
 
         X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
+        
+        z = self.encoder(self.train_transform(X)) # (B,T,embed_dim)
+        
+        logits = self.head(z)
 
-        x_hat = self(self.train_transform(X))
+        z_r = self.rope(z)
+        z_r = self.norm(z_r)
+        logits_res = self.rope_head(z_r)        
 
-        return self.compute_loss(Y_s=Y_s, Y_c=Y_c, X_hat=x_hat, step="train")
+        return self.compute_loss(Y_s=Y_s, Y_c=Y_c, logits=logits, logits_res=logits_res, step="train")
 
     def validation_step(self, val_batch, batch_idx):
         X = val_batch["img"]       # (B,C,T,H,W) presumably
@@ -2270,8 +2299,6 @@ class TemporalRefinerEffnetV2s(LightningModule):
         target_nonreject = (true_cls_f != 0).int()
         self.val_reject_fp75.update((score_pred_f >= 0.75).int(), target_nonreject)
         self.val_reject_fp90.update((score_pred_f >= 0.90).int(), target_nonreject)
-
-        
 
         # for cm
         logits_f = logits.reshape(-1, self.hparams.num_classes)
@@ -2428,8 +2455,12 @@ class TemporalRefinerEffnetV2s(LightningModule):
 
     def forward(self, x: torch.tensor):
         # X is (B,C,T,H,W)
-        feats = self.encoder(x) # (B,T,embed_dim)
-        logits = self.head(feats)
-        logits_ref = self.temporal_refiner(feats, logits)
+        z = self.encoder(x) # (B,T,embed_dim)
+        
+        logits = self.head(z)
 
-        return logits_ref
+        z = self.rope(z)
+        z = self.norm(z)
+        logits_res = self.rope_head(z)
+
+        return logits + logits_res

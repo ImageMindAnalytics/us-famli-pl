@@ -17,6 +17,8 @@ from lightning.pytorch.strategies import DDPStrategy
 
 from lightning.pytorch.loggers import NeptuneLogger
 
+torch.set_float32_matmul_precision('medium')
+
 def main(args):
 
     if args.out and not os.path.exists(args.out):

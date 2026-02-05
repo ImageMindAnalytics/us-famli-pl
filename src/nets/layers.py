@@ -587,8 +587,8 @@ class RoPECache(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         self._seq_len_cached = 0
-        self.register_buffer("_cos_cached", torch.empty(0), persistent=False)
-        self.register_buffer("_sin_cached", torch.empty(0), persistent=False)
+        self._cos_cached = None
+        self._sin_cached = None
 
     def get_cos_sin(self, seq_len: int, device=None, dtype=None):
         if seq_len <= self._seq_len_cached and self._cos_cached.device == (device or self._cos_cached.device) and self._cos_cached.dtype == (dtype or self._cos_cached.dtype):
@@ -738,4 +738,4 @@ class TemporalRefinerTCN(nn.Module):
         x = x.transpose(1, 2)                   # (B,D+C,T)
         h = self.net(x)                         # (B,H,T)
         dlogits = self.out(h).transpose(1, 2)   # (B,T,C)
-        return logits + dlogits
+        return dlogits
