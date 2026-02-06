@@ -2029,6 +2029,10 @@ class TemporalRefinerEffnetV2s(LightningModule):
         self.film_beta = nn.Linear(self.hparams.num_classes, self.hparams.embed_dim)
         nn.init.zeros_(self.film_beta.weight)
         nn.init.zeros_(self.film_beta.bias)
+        
+        self.gate = nn.Linear(self.hparams.embed_dim, 1)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
 
         self.rope_head = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
         nn.init.zeros_(self.rope_head.weight)
@@ -2149,7 +2153,7 @@ class TemporalRefinerEffnetV2s(LightningModule):
                                 weight_decay=self.hparams.weight_decay)
         return optimizer
     
-    def compute_loss(self, Y_s, logits, logits_res, Y_c=None, gate=None, step="train", sync_dist=False):
+    def compute_loss(self, Y_s, logits, Y_c=None, step="train", sync_dist=False):
 
         # print("Y unique:", torch.unique(Y))
         # print("Y min/max:", Y.min().item(), Y.max().item())
@@ -2158,29 +2162,10 @@ class TemporalRefinerEffnetV2s(LightningModule):
         # print("X_hat min/max:", X_hat.min().item(), X_hat.max().item())
         # print("Number of zeros in X_hat:", (X_hat == 0).sum().item())
 
-        C = self.hparams.num_classes        
+        C = self.hparams.num_classes
+        logits_f = logits.reshape(-1, C)
 
-        logits_ctx = logits + logits_res
-
-        loss_ctx = self.loss_fn(logits_ctx, y=Y_s.float(), y_class=Y_c)
-        loss_base = self.loss_fn(logits, y=Y_s.float(), y_class=Y_c)
-
-        p_base = torch.softmax(logits.detach(), dim=-1)
-        p_ctx  = torch.softmax(logits_ctx, dim=-1)
-        loss_kl = F.kl_div(torch.log(p_ctx.clamp_min(1e-8)), p_base, reduction="batchmean")
-        loss_l2 = (logits_res ** 2).mean()
-
-        loss = 1.0 * loss_ctx + 0.1 * loss_base + 0.00 * loss_kl + 3e-4 * loss_l2
-
-        if(gate is not None):
-            loss_gate = torch.relu(gate - 0.02).mean()
-            self.log(f"{step}_gate_mean", loss_gate, prog_bar=True, sync_dist=True)
-            self.log(f"{step}_gate_p95",  torch.quantile(gate.detach().flatten(), 0.95), sync_dist=True)
-
-            loss = loss + 1e-4 * loss_gate
-
-
-        logits_f = logits_ctx.reshape(-1, C)
+        loss = self.loss_fn(logits, y=Y_s.float(), y_class=Y_c)
 
         if(Y_c is not None):
             y_class = Y_c
@@ -2212,7 +2197,7 @@ class TemporalRefinerEffnetV2s(LightningModule):
                 self.log(f"{step}_top_rate", is_top.mean(), sync_dist=sync_dist)
                 self.log(f"{step}_margin_mean", margin.mean(), sync_dist=sync_dist)
                 if is_top.bool().any():
-                    self.log(f"{step}_margin_pos_mean", margin[is_top.bool()].mean(), sync_dist=sync_dist) # this must increase during training
+                    self.log(f"{step}_margin_pos_mean", margin[is_top.bool()].mean(), sync_dist=sync_dist)
                 self.log(f"{step}_margin_neg_mean", margin[~is_top.bool()].mean(), sync_dist=sync_dist)
 
         if self.hparams.reject_tail_weight > 0.0 and Y_c is not None and step == "train":
@@ -2245,16 +2230,12 @@ class TemporalRefinerEffnetV2s(LightningModule):
                 warm = min(1.0, float(self.global_step - self.hparams.temporal_derivative_warmup_steps[0]) / float(self.hparams.temporal_derivative_warmup_steps[1] - self.hparams.temporal_derivative_warmup_steps[0]))
             dml = warm * self.hparams.temporal_derivative_weight * derivative_match_loss(s, Y_s.float(), power=getattr(self.hparams, "temporal_derivative_power", 1))            
             loss = loss + dml
-            self.log(f"{step}_derivative_match_loss", dml, sync_dist=sync_dist)                
+            self.log(f"{step}_derivative_match_loss", dml, sync_dist=sync_dist)    
 
         self.log(f"{step}_loss", loss, sync_dist=sync_dist)
-        self.log(f"{step}_loss_ctx", loss_ctx, sync_dist=sync_dist)
-        self.log(f"{step}_loss_base", loss_base, sync_dist=sync_dist)
-        self.log(f"{step}_loss_kl", loss_kl, sync_dist=sync_dist)
-        self.log(f"{step}_loss_l2", loss_l2, sync_dist=sync_dist)
-
 
         return loss
+    
 
     def training_step(self, train_batch, batch_idx):
         X = train_batch["img"]
@@ -2263,16 +2244,9 @@ class TemporalRefinerEffnetV2s(LightningModule):
 
         X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
         
-        z = self.encoder(self.train_transform(X)) # (B,T,embed_dim)
-        
-        logits = self.head(z)
+        logits = self(self.train_transform(X))        
 
-        z_r = self.rope(z)
-        z_r = self.norm(z_r)
-        g = torch.sigmoid(self.gate(z_r))
-        logits_res = g * self.rope_head(z_r)        
-
-        return self.compute_loss(Y_s=Y_s, Y_c=Y_c, gate=g, logits=logits, logits_res=logits_res, step="train")
+        return self.compute_loss(Y_s=Y_s, Y_c=Y_c, logits=logits, step="train")
 
     def validation_step(self, val_batch, batch_idx):
         X = val_batch["img"]       # (B,C,T,H,W) presumably
@@ -2418,51 +2392,57 @@ class TemporalRefinerEffnetV2s(LightningModule):
 
 
     def test_step(self, test_batch, batch_idx):
-        X = test_batch["img"]
-        Y_s = test_batch["scalar"]
-        Y_c = test_batch["class"]
+        X = test_batch["img"]       # (B,C,T,H,W) presumably
+        Y_s = test_batch["scalar"]  # (B,T) or (B,N) float scores
+        Y_c = test_batch["class"]   # (B,T) int 0..C-1
 
-        X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
+        X = X.permute(0, 2, 1, 3, 4)  # -> (B,T,C,H,W)
+        logits = self(X)             # (B,T,C)
 
-        x_hat = self(X)
+        # for cm
+        logits_f = logits.reshape(-1, self.hparams.num_classes)
+        y_f = Y_c.reshape(-1)
 
-        self.compute_loss(Y_s=Y_s, Y_c=Y_c, X_hat=x_hat, step="test", sync_dist=True)
-        
-        Y_c = Y_c.view(-1)
-        x_hat = x_hat.view(-1, self.hparams.num_classes)
-        
-        self.probs.update(x_hat.softmax(dim=-1))
-        self.targets.update(Y_c)
-        self.conf.update(x_hat, Y_c)
+        self.probs.update(logits_f.softmax(dim=-1))
+        self.targets.update(y_f)
+        self.conf.update(logits_f, y_f)
 
     def on_test_epoch_end(self):
         probs = self.probs.compute()
         targets = self.targets.compute()
-        confmat  = self.conf.compute()
+        confmat = self.conf.compute()
 
         if self.trainer.is_global_zero:
             logger = self.trainer.logger
-            run = logger.experiment  
-            
+            run = logger.experiment
+
             experiment = None
             if isinstance(logger, NeptuneLogger):
                 experiment = run["images/test_confusion_matrix"]
-                
+
             out_path = None
             if os.path.exists(self.hparams.out):
                 out_path = os.path.join(self.hparams.out, "test_confusion_matrix.png")
-                    
-            plot_confusion_matrix(confmat.cpu().numpy(), np.arange(self.hparams.num_classes), experiment=experiment, out_path=out_path)
+            plot_confusion_matrix(
+                confmat.cpu().numpy(),
+                np.arange(self.hparams.num_classes),
+                experiment=experiment,
+                out_path=out_path
+            )
 
             experiment = None
             if isinstance(logger, NeptuneLogger):
                 experiment = run["reports/test_classification_report"]
-                
+
             out_path = None
             if os.path.exists(self.hparams.out):
                 out_path = os.path.join(self.hparams.out, "test_classification_report.json")
-                    
-            compute_classification_report(targets.cpu().numpy(), probs.argmax(dim=-1).cpu().numpy(), experiment=experiment, out_path=out_path)
+            compute_classification_report(
+                targets.cpu().numpy(),
+                probs.argmax(dim=-1).cpu().numpy(),
+                experiment=experiment,
+                out_path=out_path
+            )
 
         self.probs.reset()
         self.targets.reset()
@@ -2475,14 +2455,15 @@ class TemporalRefinerEffnetV2s(LightningModule):
         logits = self.head(z)
 
         p = torch.softmax(logits.detach(), dim=-1)          # (B,T,C)
-        gamma = self.film_gamma(p)                          # (B,T,D)
-        beta  = self.film_beta(p)                           # (B,T,D)
-        z = z * (1 + gamma) + beta
+        gamma = 0.1 * torch.tanh(self.film_gamma(p))                          # (B,T,D)
+        beta  = 0.1 * torch.tanh(self.film_beta(p))                           # (B,T,D)
+        z = z * (1.0 + gamma) + beta
 
         z = self.rope(z)
         z = self.norm(z)
-        z = self.rope_head(z)
+
+        g = torch.sigmoid(self.gate(z))
         
-        logits_ctx = logits + self.rope_head(z)
+        logits_ctx = logits + g*self.rope_head(z)
 
         return logits_ctx
