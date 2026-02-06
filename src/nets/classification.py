@@ -826,9 +826,7 @@ class RopeEffnetV2s(LightningModule):
         self.encoder = TimeDistributed(encoder)
 
         self.rope = RoPETransformerBlock(dim=self.hparams.embed_dim, num_heads=self.hparams.num_heads, mlp_ratio=self.hparams.mlp_ratio, dropout=self.hparams.dropout)
-
-        self.norm = nn.LayerNorm(self.hparams.embed_dim)
-        
+        self.norm = nn.LayerNorm(self.hparams.embed_dim)        
         self.proj = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
 
         self.train_transform = v2.Compose(
@@ -2024,10 +2022,13 @@ class TemporalRefinerEffnetV2s(LightningModule):
         self.rope = RoPETransformerBlock(dim=self.hparams.embed_dim, num_heads=self.hparams.num_heads, mlp_ratio=self.hparams.mlp_ratio, dropout=self.hparams.dropout)
         self.norm = nn.LayerNorm(self.hparams.embed_dim)
 
-        self.gate = nn.Linear(self.hparams.embed_dim, 1)
-        nn.init.zeros_(self.gate.weight)
-        self.gate.bias.data.fill_(-4.0)   # sigmoid(-4) ~ 0.018
+        self.film_gamma = nn.Linear(self.hparams.num_classes, self.hparams.embed_dim)
+        nn.init.zeros_(self.film_gamma.weight)
+        nn.init.zeros_(self.film_gamma.bias)
 
+        self.film_beta = nn.Linear(self.hparams.num_classes, self.hparams.embed_dim)
+        nn.init.zeros_(self.film_beta.weight)
+        nn.init.zeros_(self.film_beta.bias)
 
         self.rope_head = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
         nn.init.zeros_(self.rope_head.weight)
@@ -2470,13 +2471,18 @@ class TemporalRefinerEffnetV2s(LightningModule):
 
     def forward(self, x: torch.tensor):
         # X is (B,C,T,H,W)
-        z = self.encoder(x) # (B,T,embed_dim)
-        
+        z = self.encoder(x) # (B,T,embed_dim)        
         logits = self.head(z)
+
+        p = torch.softmax(logits.detach(), dim=-1)          # (B,T,C)
+        gamma = self.film_gamma(p)                          # (B,T,D)
+        beta  = self.film_beta(p)                           # (B,T,D)
+        z = z * (1 + gamma) + beta
 
         z = self.rope(z)
         z = self.norm(z)
-        g = torch.sigmoid(self.gate(z))
-        logits_res = g * self.rope_head(z)
+        z = self.rope_head(z)
+        
+        logits_ctx = logits + self.rope_head(z)
 
-        return logits + logits_res
+        return logits_ctx
