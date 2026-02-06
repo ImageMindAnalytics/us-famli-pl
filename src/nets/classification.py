@@ -2023,6 +2023,12 @@ class TemporalRefinerEffnetV2s(LightningModule):
 
         self.rope = RoPETransformerBlock(dim=self.hparams.embed_dim, num_heads=self.hparams.num_heads, mlp_ratio=self.hparams.mlp_ratio, dropout=self.hparams.dropout)
         self.norm = nn.LayerNorm(self.hparams.embed_dim)
+
+        self.gate = nn.Linear(self.hparams.embed_dim, 1)
+        nn.init.zeros_(self.gate.weight)
+        self.gate.bias.data.fill_(-4.0)   # sigmoid(-4) ~ 0.018
+
+
         self.rope_head = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
         nn.init.zeros_(self.rope_head.weight)
         nn.init.zeros_(self.rope_head.bias)
@@ -2142,7 +2148,7 @@ class TemporalRefinerEffnetV2s(LightningModule):
                                 weight_decay=self.hparams.weight_decay)
         return optimizer
     
-    def compute_loss(self, Y_s, logits, logits_res, Y_c=None, step="train", sync_dist=False):
+    def compute_loss(self, Y_s, logits, logits_res, Y_c=None, gate=None, step="train", sync_dist=False):
 
         # print("Y unique:", torch.unique(Y))
         # print("Y min/max:", Y.min().item(), Y.max().item())
@@ -2163,7 +2169,15 @@ class TemporalRefinerEffnetV2s(LightningModule):
         loss_kl = F.kl_div(torch.log(p_ctx.clamp_min(1e-8)), p_base, reduction="batchmean")
         loss_l2 = (logits_res ** 2).mean()
 
-        loss = 1.0 * loss_ctx + 0.2 * loss_base + 0.01 * loss_kl + 3e-4 * loss_l2
+        loss = 1.0 * loss_ctx + 0.1 * loss_base + 0.00 * loss_kl + 3e-4 * loss_l2
+
+        if(gate is not None):
+            loss_gate = torch.relu(gate - 0.02).mean()
+            self.log(f"{step}_gate_mean", loss_gate, prog_bar=True, sync_dist=True)
+            self.log(f"{step}_gate_p95",  torch.quantile(gate.detach().flatten(), 0.95), sync_dist=True)
+
+            loss = loss + 1e-4 * loss_gate
+
 
         logits_f = logits_ctx.reshape(-1, C)
 
@@ -2254,9 +2268,10 @@ class TemporalRefinerEffnetV2s(LightningModule):
 
         z_r = self.rope(z)
         z_r = self.norm(z_r)
-        logits_res = self.rope_head(z_r)        
+        g = torch.sigmoid(self.gate(z_r))
+        logits_res = g * self.rope_head(z_r)        
 
-        return self.compute_loss(Y_s=Y_s, Y_c=Y_c, logits=logits, logits_res=logits_res, step="train")
+        return self.compute_loss(Y_s=Y_s, Y_c=Y_c, gate=g, logits=logits, logits_res=logits_res, step="train")
 
     def validation_step(self, val_batch, batch_idx):
         X = val_batch["img"]       # (B,C,T,H,W) presumably
@@ -2461,6 +2476,7 @@ class TemporalRefinerEffnetV2s(LightningModule):
 
         z = self.rope(z)
         z = self.norm(z)
-        logits_res = self.rope_head(z)
+        g = torch.sigmoid(self.gate(z))
+        logits_res = g * self.rope_head(z)
 
         return logits + logits_res
