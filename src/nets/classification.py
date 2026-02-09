@@ -881,7 +881,7 @@ class RopeEffnetV2s(LightningModule):
 
         group.add_argument("--top_aux_weight", type=float, default=0.0, help='Weight for auxiliary loss on top class')
         group.add_argument("--top_pos_weight", type=float, default=7.0, help='Positive weight for auxiliary loss on top class')
-        group.add_argument("--top_aux_warmup_steps", type=int, default=2000, help='Number of warmup steps for auxiliary loss on top class')
+        group.add_argument("--top_aux_warmup_steps", type=int, nargs="+", default=[2000, 4000], help='Number of warmup steps for auxiliary loss on top class')
 
         group.add_argument("--reject_tail_weight", type=float, default=0.00, help='Weight for reject tail penalty')
         group.add_argument("--reject_tau", type=float, default=0.85, help='Reject tail threshold')
@@ -945,11 +945,13 @@ class RopeEffnetV2s(LightningModule):
             margin = logit_top - logit_rest
             aux = F.binary_cross_entropy_with_logits(margin, is_top, reduction="none", pos_weight=pos_w)           
 
-            if self.hparams.top_aux_warmup_steps > 0:
-                warm = min(1.0, float(self.global_step) / float(self.hparams.top_aux_warmup_steps))
+            if self.hparams.top_aux_warmup_steps is not None and self.hparams.top_aux_warmup_steps[0] <= self.global_step and self.global_step < self.hparams.top_aux_warmup_steps[1]:
+                warm = min(1.0, float(self.global_step - self.hparams.top_aux_warmup_steps[0]) / float(self.hparams.top_aux_warmup_steps[1] - self.hparams.top_aux_warmup_steps[0]))
                 aux_w = self.hparams.top_aux_weight * warm
-            else:
+            elif self.hparams.top_aux_warmup_steps is not None and  self.hparams.top_aux_warmup_steps[1] <= self.global_step:
                 aux_w = self.hparams.top_aux_weight
+            else:
+                aux_w = 0
 
             aux_mean = aux.mean() * aux_w
 
@@ -2182,11 +2184,14 @@ class TemporalRefinerEffnetV2s(LightningModule):
             margin = logit_top - logit_rest
             aux = F.binary_cross_entropy_with_logits(margin, is_top, reduction="none", pos_weight=pos_w)           
 
-            if self.hparams.top_aux_warmup_steps > 0:
-                warm = min(1.0, float(self.global_step) / float(self.hparams.top_aux_warmup_steps))
+            if self.hparams.top_aux_warmup_steps is not None and self.hparams.top_aux_warmup_steps[0] <= self.global_step and self.global_step < self.hparams.top_aux_warmup_steps[1]:
+                warm = min(1.0, float(self.global_step - self.hparams.top_aux_warmup_steps[0]) / float(self.hparams.top_aux_warmup_steps[1] - self.hparams.top_aux_warmup_steps[0]))
                 aux_w = self.hparams.top_aux_weight * warm
-            else:
+            elif self.hparams.top_aux_warmup_steps is not None and  self.hparams.top_aux_warmup_steps[1] <= self.global_step:
                 aux_w = self.hparams.top_aux_weight
+            else:
+                aux_w = 0
+                
 
             aux_mean = aux.mean() * aux_w
 
