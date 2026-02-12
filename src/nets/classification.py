@@ -877,7 +877,7 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--bins", type=float, nargs="+", default=(0.0, 0.25, 0.5, 0.75, 1.0), help='Bins for Ordinal EMD Loss')
         group.add_argument("--class_weights", type=float, nargs="+", default=[0.03603907, 0.14391553, 0.85467111, 1.73506923, 2.23030506], help='Class weights for Ordinal EMD Loss')
         group.add_argument("--bin_weights", type=float, nargs="+", default=[0.23809524, 0.47619048, 0.71428571, 1.19047619, 2.38095238], help='Bin weights for Ordinal EMD Loss')
-        group.add_argument("--num_classes", type=int, default=5, help='Output channels for projection head')
+        group.add_argument("--num_classes", type=int, default=5, help='Output channels for projection head')        
 
         group.add_argument("--top_aux_weight", type=float, default=0.0, help='Weight for auxiliary loss on top class')
         group.add_argument("--top_pos_weight", type=float, default=7.0, help='Positive weight for auxiliary loss on top class')
@@ -1035,7 +1035,7 @@ class RopeEffnetV2s(LightningModule):
         # flatten for metrics
         pred_cls_f = pred_cls.reshape(-1)
         true_cls_f = true_cls.reshape(-1)
-        score_pred_f = score_pred.reshape(-1)
+        score_pred_f = score_pred.reshape(-1)        
 
         # -------------------------
         # (A) measurable recall
@@ -1060,6 +1060,8 @@ class RopeEffnetV2s(LightningModule):
         logits_f = logits.reshape(-1, self.hparams.num_classes)
         y_f = Y_c.reshape(-1)
 
+
+        self.val_recall.update(logits_f, y_f)
         self.probs.update(logits_f.softmax(dim=-1))
         self.targets.update(y_f)
         self.conf.update(logits_f, y_f)
@@ -1100,13 +1102,7 @@ class RopeEffnetV2s(LightningModule):
 
         lam = getattr(self.hparams, "earlystop_fp_lambda", 0.25)
         mu  = getattr(self.hparams, "earlystop_fp_tail_lambda", 1.0)
-
-        val_select = recall_meas - lam * fp_reject_075 - mu * fp_reject_090
-
-        self.log("val_recall_meas", recall_meas, prog_bar=True)
-        self.log("val_fp_reject_075", fp_reject_075, prog_bar=True)
-        self.log("val_fp_reject_090", fp_reject_090, prog_bar=True)
-        self.log("val_select", val_select, prog_bar=True)
+        
 
         self.val_meas_stats.reset()
         self.val_reject_fp75.reset()
@@ -1116,6 +1112,18 @@ class RopeEffnetV2s(LightningModule):
         probs = self.probs.compute()
         targets = self.targets.compute()
         confmat = self.conf.compute()
+        recall = self.val_recall.compute()
+
+        rec_top3 = recall[-3:].mean()
+        val_select = rec_top3 - lam * fp_reject_075 - mu * fp_reject_090
+
+
+        self.log("val_recall_meas", recall_meas, prog_bar=True)
+        self.log("val_fp_reject_075", fp_reject_075, prog_bar=True)
+        self.log("val_fp_reject_090", fp_reject_090, prog_bar=True)
+        self.log("val_select", val_select, prog_bar=True)
+        self.log("val_rec_top3", rec_top3, prog_bar=True)
+
 
         if self.trainer.is_global_zero:
             logger = self.trainer.logger
@@ -1154,6 +1162,7 @@ class RopeEffnetV2s(LightningModule):
         self.probs.reset()
         self.targets.reset()
         self.conf.reset()
+        self.val_recall.reset()
 
 
 
@@ -2472,3 +2481,317 @@ class TemporalRefinerEffnetV2s(LightningModule):
         logits_ctx = logits + g*self.rope_head(z)
 
         return logits_ctx
+
+
+class RopeEffnetV2sCE(LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        encoder = torchvision.models.efficientnet_v2_s(weights='IMAGENET1K_V1')
+        encoder.classifier = nn.Linear(self.hparams.features, self.hparams.embed_dim)
+
+        self.encoder = TimeDistributed(encoder)
+
+        self.rope = RoPETransformerBlock(dim=self.hparams.embed_dim, num_heads=self.hparams.num_heads, mlp_ratio=self.hparams.mlp_ratio, dropout=self.hparams.dropout)
+        self.norm = nn.LayerNorm(self.hparams.embed_dim)        
+        self.proj = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
+
+        self.train_transform = v2.Compose(
+            [
+                v2.RandomHorizontalFlip(),
+                v2.RandomRotation(180),
+                v2.RandomResizedCrop(size=256, scale=(0.25, 1.0), ratio=(0.75, 1.3333333333333333)),
+                v2.RandomApply([v2.GaussianBlur(5, sigma=(0.1, 2.0))], p=0.5),
+                v2.ColorJitter(brightness=[0.5, 1.5], contrast=[0.5, 1.5], saturation=[0.5, 1.5], hue=[-.2, .2])
+            ]
+        )
+        
+        self.loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(self.hparams.class_weights) if hasattr(self.hparams, 'class_weights') else None)        
+
+        self.accuracy = Accuracy(task='multiclass', num_classes=self.hparams.num_classes)
+        self.conf = torchmetrics.ConfusionMatrix(task='multiclass', num_classes=self.hparams.num_classes, normalize='true')
+
+        self.probs = CatMetric()
+        self.targets = CatMetric()
+
+        # Recall for class 4 (multiclass)
+        self.val_recall = torchmetrics.classification.MulticlassRecall(
+            num_classes=self.hparams.num_classes,
+            average=None,        # returns per-class recall
+        )
+
+        # measurable detection: target = 1 if true in {3,4}, pred = 1 if score_pred >= 0.75
+        self.val_meas_stats = torchmetrics.classification.BinaryStatScores(threshold=0.5)  
+        # (threshold irrelevant since we pass int preds, but torchmetrics requires one)
+
+        # reject false positives at two thresholds (0.75 and 0.9)
+        self.val_reject_fp75 = torchmetrics.classification.BinaryStatScores(threshold=0.75)
+        self.val_reject_fp90 = torchmetrics.classification.BinaryStatScores(threshold=0.90)
+        # returns (tp, fp, tn, fn) aggregated across GPUs
+
+
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        group = parent_parser.add_argument_group("BCE with Regression Model")
+
+        group.add_argument("--lr", type=float, default=1e-3)
+        group.add_argument("--betas", type=float, nargs="+", default=(0.9, 0.999), help='Betas for Adam optimizer')
+        group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=1e-2)
+        
+        group.add_argument("--bins", type=float, nargs="+", default=(0.0, 0.25, 0.5, 0.75, 1.0), help='Bins for val select score')
+        group.add_argument("--class_weights", type=float, nargs="+", default=[0.03603907, 0.14391553, 0.85467111, 1.73506923, 2.23030506], help='Class weights for CE Loss')        
+        group.add_argument("--num_classes", type=int, default=5, help='Output channels for projection head')        
+        
+        group.add_argument("--meas_thresh", type=float, default=0.75)
+        group.add_argument("--earlystop_fp_lambda", type=float, default=0.25)
+        group.add_argument("--earlystop_fp_tail_lambda", type=float, default=1.0)
+        
+        # Image Encoder parameters         
+        group.add_argument("--in_channels", type=int, default=3, help='Input channels for encoder')
+        group.add_argument("--features", type=int, default=1280, help='Number of output features for the encoder')
+        group.add_argument("--embed_dim", type=int, default=128, help='Embedding dimension for the model')
+        group.add_argument("--num_heads", type=int, default=8, help='Number of heads for RoPE transformer')
+        group.add_argument("--mlp_ratio", type=float, default=4.0, help='MLP ratio for RoPE transformer')
+        group.add_argument("--dropout", type=float, default=0.2, help='Dropout rate for RoPE transformer')
+
+        return parent_parser
+    
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(),
+                                lr=self.hparams.lr,
+                                betas=self.hparams.betas,
+                                weight_decay=self.hparams.weight_decay)
+        return optimizer
+    
+    def compute_loss(self, Y_s, X_hat, Y_c=None, step="train", sync_dist=False):
+
+        C = self.hparams.num_classes
+        logits = X_hat
+        logits_f = logits.reshape(-1, C)
+
+        y_class_f = Y_c.reshape(-1)
+
+        loss = self.loss_fn(logits_f, y_class_f)
+
+        self.log(f"{step}_loss", loss, sync_dist=sync_dist)
+
+        return loss
+
+    def training_step(self, train_batch, batch_idx):
+        X = train_batch["img"]
+        Y_s = train_batch["scalar"]
+        Y_c = train_batch["class"]
+
+        X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
+
+        x_hat = self(self.train_transform(X))
+
+        return self.compute_loss(Y_s=Y_s, Y_c=Y_c, X_hat=x_hat, step="train")
+
+    def validation_step(self, val_batch, batch_idx):
+        X = val_batch["img"]       # (B,C,T,H,W) presumably
+        Y_s = val_batch["scalar"]  # (B,T) or (B,N) float scores
+        Y_c = val_batch["class"]   # (B,T) int 0..C-1
+
+        X = X.permute(0, 2, 1, 3, 4)  # -> (B,T,C,H,W)
+        logits = self(X)             # (B,T,C)
+
+        loss = self.compute_loss(Y_s=Y_s, Y_c=Y_c, X_hat=logits, step="val", sync_dist=True)        
+
+        bins = logits.new_tensor(self.hparams.bins)  # (C,)
+
+        # expected score in [0,1]
+        p = torch.softmax(logits, dim=-1)
+        score_pred = (p * bins).sum(dim=-1)          # (B,T)
+
+        # nearest-bin predicted class
+        pred_cls = torch.argmin(torch.abs(score_pred[..., None] - bins), dim=-1)  # (B,T)
+
+        # true class: use Y_c directly (safer than Y_s->bins mapping)
+        true_cls = Y_c  # (B,T)
+
+        # flatten for metrics
+        pred_cls_f = pred_cls.reshape(-1)
+        true_cls_f = true_cls.reshape(-1)
+        score_pred_f = score_pred.reshape(-1)
+
+        # -------------------------
+        # (A) measurable recall
+        # -------------------------
+        is_meas = (true_cls_f >= 3).int()  # classes 3,4
+        pred_meas = (score_pred_f >= self.hparams.meas_thresh).int()
+        self.val_meas_stats.update(pred_meas, is_meas)
+
+        # -------------------------
+        # (B) reject FP at 0.75/0.9
+        # target_bin: 0=reject, 1=non-reject
+        # pred_pos: predicted non-reject by thresholding score_pred
+        # FP/(FP+TN) computed at epoch end is P(pred_pos=1 | target_bin=0)
+        # -------------------------
+        target_nonreject = (true_cls_f != 0).int()
+        self.val_reject_fp75.update((score_pred_f >= 0.75).int(), target_nonreject)
+        self.val_reject_fp90.update((score_pred_f >= 0.90).int(), target_nonreject)
+
+        
+
+        # for cm
+        logits_f = logits.reshape(-1, self.hparams.num_classes)
+        y_f = Y_c.reshape(-1)
+
+        self.probs.update(logits_f.softmax(dim=-1))
+        self.targets.update(y_f)
+        self.conf.update(logits_f, y_f)
+
+    def _unpack_bss(self, bss):
+        """
+        Torchmetrics BinaryStatScores compute() can return:
+        - tuple(tp, fp, tn, fn)  (older)
+        - tensor([tp, fp, tn, fn, sup]) or shape (...,5) (newer)
+        Returns: tp, fp, tn, fn as scalars/tensors
+        """
+        if isinstance(bss, (tuple, list)):
+            tp, fp, tn, fn = bss[:4]
+            return tp, fp, tn, fn
+
+        # tensor output
+        # last dim is [tp, fp, tn, fn, sup]
+        tp = bss[..., 0]
+        fp = bss[..., 1]
+        tn = bss[..., 2]
+        fn = bss[..., 3]
+        return tp, fp, tn, fn
+        
+    def on_validation_epoch_end(self):
+        # measurable recall = TP / (TP + FN)
+        bss = self.val_meas_stats.compute()
+        tp, fp, tn, fn = self._unpack_bss(bss)
+        recall_meas = tp / (tp + fn + 1e-8)
+
+        # reject FP@0.75 = FP / (FP + TN) in the nonreject-vs-reject binary framing
+        bss75 = self.val_reject_fp75.compute()
+        tp, fp, tn, fn = self._unpack_bss(bss75)
+        fp_reject_075 = fp / (fp + tn + 1e-8)
+
+        bss90 = self.val_reject_fp90.compute()
+        tp, fp, tn, fn = self._unpack_bss(bss90)
+        fp_reject_090 = fp / (fp + tn + 1e-8)
+
+        lam = getattr(self.hparams, "earlystop_fp_lambda", 0.25)
+        mu  = getattr(self.hparams, "earlystop_fp_tail_lambda", 1.0)
+
+        val_select = recall_meas - lam * fp_reject_075 - mu * fp_reject_090
+
+        self.log("val_recall_meas", recall_meas, prog_bar=True)
+        self.log("val_fp_reject_075", fp_reject_075, prog_bar=True)
+        self.log("val_fp_reject_090", fp_reject_090, prog_bar=True)
+        self.log("val_select", val_select, prog_bar=True)
+
+        self.val_meas_stats.reset()
+        self.val_reject_fp75.reset()
+        self.val_reject_fp90.reset()
+
+        # confusion matrix/report 
+        probs = self.probs.compute()
+        targets = self.targets.compute()
+        confmat = self.conf.compute()
+
+        if self.trainer.is_global_zero:
+            logger = self.trainer.logger
+            run = logger.experiment
+
+            experiment = None
+            if isinstance(logger, NeptuneLogger):
+                experiment = run["images/val_confusion_matrix"]
+
+            out_path = None
+            if os.path.exists(self.hparams.out):
+                out_path = os.path.join(self.hparams.out, "val_confusion_matrix.png")
+
+            plot_confusion_matrix(
+                confmat.cpu().numpy(),
+                np.arange(self.hparams.num_classes),
+                experiment=experiment,
+                out_path=out_path
+            )
+
+            experiment = None
+            if isinstance(logger, NeptuneLogger):
+                experiment = run["reports/val_classification_report"]
+
+            out_path = None
+            if os.path.exists(self.hparams.out):
+                out_path = os.path.join(self.hparams.out, "val_classification_report.json")
+
+            compute_classification_report(
+                targets.cpu().numpy(),
+                probs.argmax(dim=-1).cpu().numpy(),
+                experiment=experiment,
+                out_path=out_path
+            )
+
+        self.probs.reset()
+        self.targets.reset()
+        self.conf.reset()
+
+
+
+    def test_step(self, test_batch, batch_idx):
+        X = test_batch["img"]
+        Y_s = test_batch["scalar"]
+        Y_c = test_batch["class"]
+
+        X = X.permute(0, 2, 1, 3, 4)  # Shape is now [B, T, C, H, W]
+
+        x_hat = self(X)
+
+        self.compute_loss(Y_s=Y_s, Y_c=Y_c, X_hat=x_hat, step="test", sync_dist=True)
+        
+        Y_c = Y_c.view(-1)
+        x_hat = x_hat.view(-1, self.hparams.num_classes)
+        
+        self.probs.update(x_hat.softmax(dim=-1))
+        self.targets.update(Y_c)
+        self.conf.update(x_hat, Y_c)
+
+    def on_test_epoch_end(self):
+        probs = self.probs.compute()
+        targets = self.targets.compute()
+        confmat  = self.conf.compute()
+
+        if self.trainer.is_global_zero:
+            logger = self.trainer.logger
+            run = logger.experiment  
+            
+            experiment = None
+            if isinstance(logger, NeptuneLogger):
+                experiment = run["images/test_confusion_matrix"]
+                
+            out_path = None
+            if os.path.exists(self.hparams.out):
+                out_path = os.path.join(self.hparams.out, "test_confusion_matrix.png")
+                    
+            plot_confusion_matrix(confmat.cpu().numpy(), np.arange(self.hparams.num_classes), experiment=experiment, out_path=out_path)
+
+            experiment = None
+            if isinstance(logger, NeptuneLogger):
+                experiment = run["reports/test_classification_report"]
+                
+            out_path = None
+            if os.path.exists(self.hparams.out):
+                out_path = os.path.join(self.hparams.out, "test_classification_report.json")
+                    
+            compute_classification_report(targets.cpu().numpy(), probs.argmax(dim=-1).cpu().numpy(), experiment=experiment, out_path=out_path)
+
+        self.probs.reset()
+        self.targets.reset()
+        self.conf.reset()
+        
+
+    def forward(self, x: torch.tensor):
+
+        z = self.encoder(x)
+        z = self.rope(z)
+        z = self.norm(z)
+
+        return self.proj(z)
