@@ -881,7 +881,7 @@ class RopeEffnetV2s(LightningModule):
 
         group.add_argument("--top_aux_weight", type=float, default=0.0, help='Weight for auxiliary loss on top class')
         group.add_argument("--top_pos_weight", type=float, default=7.0, help='Positive weight for auxiliary loss on top class')
-        group.add_argument("--top_aux_warmup_steps", type=int, nargs="+", default=[2000, 4000], help='Number of warmup steps for auxiliary loss on top class')
+        group.add_argument("--top_aux_warmup_steps", type=int, nargs="+", default=[0, 2000], help='Number of warmup steps for auxiliary loss on top class')
 
         group.add_argument("--reject_tail_weight", type=float, default=0.00, help='Weight for reject tail penalty')
         group.add_argument("--reject_tau", type=float, default=0.85, help='Reject tail threshold')
