@@ -1114,15 +1114,15 @@ class RopeEffnetV2s(LightningModule):
         confmat = self.conf.compute()
         recall = self.val_recall.compute()
 
-        rec_top3 = recall[-3:].mean()
-        val_select = rec_top3 - lam * fp_reject_075 - mu * fp_reject_090
+        rec_top2 = recall[-2:].mean()
+        val_select = rec_top2 - lam * fp_reject_075 - mu * fp_reject_090
 
 
         self.log("val_recall_meas", recall_meas, prog_bar=True)
         self.log("val_fp_reject_075", fp_reject_075, prog_bar=True)
         self.log("val_fp_reject_090", fp_reject_090, prog_bar=True)
         self.log("val_select", val_select, prog_bar=True)
-        self.log("val_rec_top3", rec_top3, prog_bar=True)
+        self.log("val_rec_top2", rec_top2, prog_bar=True)
 
 
         if self.trainer.is_global_zero:
