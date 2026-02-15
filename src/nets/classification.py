@@ -829,7 +829,7 @@ class RopeEffnetV2s(LightningModule):
         self.norm = nn.LayerNorm(self.hparams.embed_dim)        
         self.proj = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
 
-        if (hasattr('proj_bias', self.hparams)):
+        if (hasattr(self.hparams, 'proj_bias')):
             self.proj.bias.data = torch.tensor(self.hparams.proj_bias)
 
         self.train_transform = v2.Compose(
