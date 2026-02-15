@@ -829,6 +829,9 @@ class RopeEffnetV2s(LightningModule):
         self.norm = nn.LayerNorm(self.hparams.embed_dim)        
         self.proj = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
 
+        if (hasattr('proj_bias', self.hparams)):
+            self.proj.bias.data = torch.tensor(self.hparams.proj_bias)
+
         self.train_transform = v2.Compose(
             [
                 v2.RandomHorizontalFlip(),
@@ -877,6 +880,8 @@ class RopeEffnetV2s(LightningModule):
         group.add_argument("--bins", type=float, nargs="+", default=(0.0, 0.25, 0.5, 0.75, 1.0), help='Bins for Ordinal EMD Loss')
         group.add_argument("--class_weights", type=float, nargs="+", default=[0.00547162, 0.02530933, 0.2180591 , 1.1444004 , 3.60675955], help='Class weights for Ordinal EMD Loss')
         group.add_argument("--bin_weights", type=float, nargs="+", default=[0.23809524, 0.47619048, 0.71428571, 1.19047619, 2.38095238], help='Bin weights for Ordinal EMD Loss')
+        group.add_argument("--proj_bias", type=float, nargs="+", default=None, help='Init proj bias')
+
         group.add_argument("--num_classes", type=int, default=5, help='Output channels for projection head')        
 
         group.add_argument("--top_aux_weight", type=float, default=0.0, help='Weight for auxiliary loss on top class')
