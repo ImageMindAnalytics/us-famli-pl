@@ -875,7 +875,7 @@ class RopeEffnetV2s(LightningModule):
 
         group.add_argument("--sigma", type=float, nargs="+", default=(0.18, 0.12, 0.12, 0.10, 0.07), help='Sigma for Ordinal EMD Loss')
         group.add_argument("--bins", type=float, nargs="+", default=(0.0, 0.25, 0.5, 0.75, 1.0), help='Bins for Ordinal EMD Loss')
-        group.add_argument("--class_weights", type=float, nargs="+", default=[0.03603907, 0.14391553, 0.85467111, 1.73506923, 2.23030506], help='Class weights for Ordinal EMD Loss')
+        group.add_argument("--class_weights", type=float, nargs="+", default=[0.00547162, 0.02530933, 0.2180591 , 1.1444004 , 3.60675955], help='Class weights for Ordinal EMD Loss')
         group.add_argument("--bin_weights", type=float, nargs="+", default=[0.23809524, 0.47619048, 0.71428571, 1.19047619, 2.38095238], help='Bin weights for Ordinal EMD Loss')
         group.add_argument("--num_classes", type=int, default=5, help='Output channels for projection head')        
 
