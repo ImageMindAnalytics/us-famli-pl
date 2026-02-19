@@ -576,41 +576,38 @@ class RoPECache(nn.Module):
     """
     Caches cos/sin for RoPE for a given head dimension.
     """
-    def __init__(self, head_dim: int, base: float = 10000.0):
+    def __init__(self, head_dim: int, base: float = 10000.0, seq_len_cache: int = 2048):
         super().__init__()
         if head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
         self.head_dim = head_dim
         self.base = base
+        self.seq_len_cache = seq_len_cache
 
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._build_cache(seq_len_cache)
+    
+    def _build_cache(self, seq_len: int):
 
-        self._seq_len_cached = 0
-        self._cos_cached = None
-        self._sin_cached = None
-
-    def get_cos_sin(self, seq_len: int, device=None, dtype=None):
-        if seq_len <= self._seq_len_cached and self._cos_cached.device == (device or self._cos_cached.device) and self._cos_cached.dtype == (dtype or self._cos_cached.dtype):
-            cos = self._cos_cached[..., :seq_len, :]
-            sin = self._sin_cached[..., :seq_len, :]
-            return cos, sin
-
-        device = device or self.inv_freq.device
-        dtype = dtype or torch.float32
-
-        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)  # (T,)
+        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)  # (T,)
         freqs = torch.einsum("t,f->tf", t, self.inv_freq)  # (T, Dh/2)
 
         # Interleave to match Dh: [cos0, cos0, cos1, cos1, ...]
         emb = torch.cat([freqs, freqs], dim=-1)  # (T, Dh)
 
-        cos = emb.cos().to(dtype=dtype)[None, None, :, :]  # (1,1,T,Dh)
-        sin = emb.sin().to(dtype=dtype)[None, None, :, :]  # (1,1,T,Dh)
+        cos = emb.cos().to(dtype=torch.float32)[None, None, :, :]  # (1,1,T,Dh)
+        sin = emb.sin().to(dtype=torch.float32)[None, None, :, :]  # (1,1,T,Dh)
 
-        self._seq_len_cached = seq_len
-        self._cos_cached = cos
-        self._sin_cached = sin
+        self.register_buffer("cos_cache", cos, persistent=False)
+        self.register_buffer("sin_cache", sin, persistent=False)
+
+    def get_cos_sin(self, seq_len: int):
+
+        assert seq_len <= self.seq_len_cache, f"Requested seq_len {seq_len} exceeds cache of {self.seq_len_cache}"
+
+        cos = self.cos_cache[:, :, :seq_len, :]
+        sin = self.sin_cache[:, :, :seq_len, :]
         return cos, sin
 
 
@@ -631,6 +628,7 @@ class RoPESelfAttention(nn.Module):
         attn_dropout: float = 0.0,
         proj_dropout: float = 0.0,
         rope_base: float = 10000.0,
+        seq_len_cache: int = 2048,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -645,7 +643,7 @@ class RoPESelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(attn_dropout)
         self.proj_dropout = nn.Dropout(proj_dropout)
 
-        self.rope = RoPECache(head_dim=self.head_dim, base=rope_base)
+        self.rope = RoPECache(head_dim=self.head_dim, base=rope_base, seq_len_cache=seq_len_cache)
 
     def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None, causal: bool = False):
         B, T, C = x.shape
@@ -658,7 +656,7 @@ class RoPESelfAttention(nn.Module):
         k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rope.get_cos_sin(T, device=x.device, dtype=q.dtype)
+        cos, sin = self.rope.get_cos_sin(T)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
