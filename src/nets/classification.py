@@ -1132,6 +1132,27 @@ class RopeEffnetV2s(LightningModule):
         self.log("val_rec_top2", rec_top2, prog_bar=True)
         self.log("val_rec_top", rec_top, prog_bar=True)
 
+        rec_c0 = recall[0]
+        rec_c4 = recall[-1]
+
+        # Option A (recommended): "worst-case" optimizer -> forces both to improve
+        rec_04_min = torch.minimum(rec_c0, rec_c4)
+
+        # your existing select terms
+        val_select04 = rec_top - lam * fp_reject_075 - mu * fp_reject_090
+
+        # new selection candidates focused on class 0 & 4
+        val_select_04_min   = rec_04_min   - lam * fp_reject_075 - mu * fp_reject_090
+
+        # IMPORTANT in DDP: sync_dist so values are reduced across GPUs
+        self.log("val_rec_c0", rec_c0, prog_bar=True, sync_dist=True)
+        self.log("val_rec_c4", rec_c4, prog_bar=True, sync_dist=True)
+        self.log("val_rec_04_min", rec_04_min, prog_bar=True, sync_dist=True)
+
+        self.log("val_select_04_min", val_select_04_min, prog_bar=True, sync_dist=True)
+
+        # keep your existing logs too (also add sync_dist=True)
+        self.log("val_select04", val_select04, prog_bar=True, sync_dist=True)
 
         if self.trainer.is_global_zero:
             logger = self.trainer.logger
