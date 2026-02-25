@@ -832,7 +832,7 @@ class USDatasetBlindSweepWTag(Dataset):
             if self.efw_column:
                 row = df_group.iloc[0]
                 efw = row[self.efw_column]
-                ret_dict["efw"] = torch.tensor([efw], dtype=torch.float32)/1000.0
+                ret_dict["efw"] = torch.tensor([efw], dtype=torch.float32)
 
             if self.ds_ac is not None:
                 # find a random AC sweep from the training set
@@ -885,7 +885,7 @@ class USDatasetBlindSweepWTag(Dataset):
 
             if self.efw_column:
                 efw = self.df.iloc[idx][self.efw_column]
-                ret_dict["efw"] = torch.tensor([efw])/1000.0
+                ret_dict["efw"] = torch.tensor([efw])
 
             if self.tag_column:
                 sweep_tag = self.tags_dict[self.df.iloc[idx][self.tag_column]]
