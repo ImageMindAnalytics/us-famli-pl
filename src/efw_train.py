@@ -33,25 +33,26 @@ def main(args):
 
     callbacks = []
 
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=args.out,
-        filename='{epoch}-{val_loss:.2f}',
-        save_top_k=2,
-        monitor='val_loss',
-        save_last=True
-        
-    )
+    if args.monitor:
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=args.out,
+            filename='{epoch}-{val_loss:.3f}',
+            save_top_k=2,
+            monitor=args.monitor,
+            mode=args.monitor_mode,
+            save_last=True            
+        )
 
     callbacks.append(checkpoint_callback)
 
-    if args.monitor:
+    if args.monitor_additional:
         checkpoint_callback_d = ModelCheckpoint(
             dirpath=args.out,
-            filename='{epoch}-{' + args.monitor + ':.2f}',
+            filename='{epoch}-{' + args.monitor_additional + ':.3f}',
             save_top_k=2,
-            monitor=args.monitor,
-            save_last=True
-            
+            monitor=args.monitor_additional,
+            mode=args.monitor_additional_mode,
+            save_last=True            
         )
 
         callbacks.append(checkpoint_callback_d)
@@ -116,7 +117,10 @@ if __name__ == '__main__':
     output_group = parser.add_argument_group('Output')
     output_group.add_argument('--out', help='Output directory', type=str, default="./")
     output_group.add_argument('--use_early_stopping', help='Use early stopping criteria', type=int, default=1)
-    output_group.add_argument('--monitor', help='Additional metric to monitor to save checkpoints', type=str, default=None)
+    output_group.add_argument('--monitor', help='Metric to monitor to save checkpoints', type=str, default="val_loss")
+    output_group.add_argument('--monitor_mode', help='Metric to monitor to save checkpoints', type=str, default="min")
+    output_group.add_argument('--monitor_additional', help='Additional metric to monitor to save checkpoints', type=str, default=None)
+    output_group.add_argument('--monitor_additional_mode', help='Metric to monitor to save checkpoints', type=str, default="min")    
     
     log_group = parser.add_argument_group('Logging')
     log_group.add_argument('--neptune_tags', help='Neptune tags', type=str, nargs="+", default=None)
