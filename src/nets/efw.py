@@ -657,9 +657,8 @@ class EFWRopeEffnetV2s(LightningModule):
 
         idx = top_idx[..., None].expand(B, K, C)        # (B,K,C)
         top_logits = logits.gather(dim=1, index=idx)    # (B,K,C)
-
-        # weights: better to softmax over gate *logits*; but keeping your version is OK
-        w = top_s / (top_s.sum(dim=1, keepdim=True) + 1e-8)  # (B,K)
+        
+        w = torch.softmax(top_s, dim=1)            # (B,K)
         study_logit = (w[..., None] * top_logits).sum(dim=1) # (B,C)
 
         # ---- Expected value ----
@@ -670,8 +669,6 @@ class EFWRopeEffnetV2s(LightningModule):
         loss_s = F.smooth_l1_loss(y_hat, Y_n)
 
         w_hat = 500.0 + 5000.0 * y_hat
-        mae_g = (w_hat - Y_g).abs().mean()
-        bias_g = (w_hat - Y_g).mean()
 
         # ---- Optional: selection health metrics ----
         eff_frames = (1.0 / (w.pow(2).sum(dim=1) + 1e-8)).mean()
@@ -679,8 +676,6 @@ class EFWRopeEffnetV2s(LightningModule):
         self.log_dict(
             {
                 "val_loss": loss_s,
-                "val_mae_g": mae_g,
-                "val_bias_g": bias_g,
                 "val_eff_frames": eff_frames,  # should be ~K-ish if top-k dominates
             },
             prog_bar=True,
@@ -703,8 +698,8 @@ class EFWRopeEffnetV2s(LightningModule):
 
         err = (preds - targets).abs()
 
-        self.log("val_mae_g_all", err.mean(), prog_bar=True, sync_dist=True)
-        self.log("val_bias_g_all", (preds - targets).mean(), prog_bar=False, sync_dist=True)
+        self.log("val_mae_g_all", err.mean(), prog_bar=True)
+        self.log("val_bias_g_all", (preds - targets).mean(), prog_bar=True)
 
         for r in [0.05, 0.10, 0.15]:
             thr = torch.quantile(scores, r)
@@ -718,16 +713,16 @@ class EFWRopeEffnetV2s(LightningModule):
             mae_rej = err[rej].mean() if rej.any() else err.mean() * 0.0
 
             tag = int(r * 100)
-            self.log(f"val_mae_g_r{tag:02d}", mae_acc, prog_bar=(r == 0.15), sync_dist=True)
-            self.log(f"val_cov_r{tag:02d}", cov_acc, prog_bar=False, sync_dist=True)
-            self.log(f"val_bias_g_r{tag:02d}", bias_acc, prog_bar=False, sync_dist=True)
-            self.log(f"val_thr_r{tag:02d}", thr, prog_bar=False, sync_dist=True)
-            self.log(f"val_mae_g_rej{tag:02d}", mae_rej, prog_bar=False, sync_dist=True)
+            self.log(f"val_mae_g_r{tag:02d}", mae_acc, prog_bar=(r == 0.15))
+            self.log(f"val_cov_r{tag:02d}", cov_acc, prog_bar=False)
+            self.log(f"val_bias_g_r{tag:02d}", bias_acc, prog_bar=False)
+            self.log(f"val_thr_r{tag:02d}", thr, prog_bar=False)
+            self.log(f"val_mae_g_rej{tag:02d}", mae_rej, prog_bar=False)
 
-        self.log("val_score_mean", scores.mean(), prog_bar=False, sync_dist=True)
-        self.log("val_score_p10", torch.quantile(scores, 0.10), prog_bar=False, sync_dist=True)
-        self.log("val_score_p50", torch.quantile(scores, 0.50), prog_bar=False, sync_dist=True)
-        self.log("val_score_p90", torch.quantile(scores, 0.90), prog_bar=False, sync_dist=True)
+        self.log("val_score_mean", scores.mean(), prog_bar=False)
+        self.log("val_score_p10", torch.quantile(scores, 0.10), prog_bar=False)
+        self.log("val_score_p50", torch.quantile(scores, 0.50), prog_bar=False)
+        self.log("val_score_p90", torch.quantile(scores, 0.90), prog_bar=False)
 
         self.scores.reset()
         self.preds.reset()
