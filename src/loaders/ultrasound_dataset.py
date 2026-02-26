@@ -899,6 +899,62 @@ class USDatasetBlindSweepWTag(Dataset):
                 ret_dict["class"] = torch.tensor(self.class_dict[cl], dtype=torch.long)
 
             return ret_dict
+    def sample_frames_with_ac(self, scores: torch.Tensor, num_frames: int, K_top: int = 20,
+                          gamma: float = 2.0, eps: float = 0.05) -> torch.Tensor:
+    
+        """
+        scores: (T,) in [0,1]
+        returns idx: (num_frames,) sorted. If T < num_frames, repeats indices.
+        """
+        device = scores.device
+        T = scores.numel()
+        if T == 0:
+            return torch.zeros(num_frames, dtype=torch.long, device=device)
+
+        # If short sweep, sample with replacement to pad
+        if T < num_frames:
+            # bias toward higher scores when repeating
+            w = (scores.clamp_min(0.0) + eps).pow(gamma)
+            w = w / (w.sum() + 1e-8)
+            idx = torch.multinomial(w, num_samples=num_frames, replacement=True)
+            return idx.sort().values
+
+        # Normal case: T >= num_frames, sample without replacement exactly
+        K = num_frames
+        K_top = min(K_top, K)
+
+        # top-K (deterministic or lightly randomized)
+        top_idx = torch.topk(scores, k=K_top).indices  # (K_top,)
+
+        if K_top < K:
+            mask = torch.ones(T, dtype=torch.bool, device=device)
+            mask[top_idx] = False
+            cand_idx = mask.nonzero(as_tuple=False).squeeze(1)
+
+            cand_scores = scores[cand_idx]
+            w = (cand_scores.clamp_min(0.0) + eps).pow(gamma)
+            w = w / (w.sum() + 1e-8)
+
+            rest = torch.multinomial(w, num_samples=(K - K_top), replacement=False)
+            rest_idx = cand_idx[rest]
+            idx = torch.cat([top_idx, rest_idx], dim=0)
+        else:
+            idx = top_idx
+
+        # Safety: ensure exactly K unique; if not, fill from remaining uniformly
+        idx = torch.unique(idx)
+        if idx.numel() < K:
+            remaining = torch.ones(T, dtype=torch.bool, device=device)
+            remaining[idx] = False
+            fill = remaining.nonzero(as_tuple=False).squeeze(1)
+            extra = fill[torch.randperm(fill.numel(), device=device)[: (K - idx.numel())]]
+            idx = torch.cat([idx, extra], dim=0)
+
+        # If we somehow got >K (rare), trim
+        if idx.numel() > K:
+            idx = idx[:K]
+
+        return idx.sort().values
 
     def create_seq(self, df):
 
@@ -925,19 +981,30 @@ class USDatasetBlindSweepWTag(Dataset):
             img_t = torch.from_numpy(img_np).float()
             orig_seq_l = img_t.shape[0]
             idx_f = None
+
             if self.num_frames > 0:
-                idx_f = torch.randint(low=0, high=img_t.shape[0], size=(self.num_frames,))
-                idx_f = idx_f.sort().values
+                if self.df_train_ac_score is not None:
+                    scores = torch.tensor(
+                        list(
+                            self.df_train_ac_score
+                                .query('file_path == @file_path')
+                                .sort_values(by='frame_index')['score_pred']
+                        ),
+                        dtype=torch.float32,
+                    )
+                    assert len(scores) == orig_seq_l
+
+                    idx_f = self.sample_frames_with_ac(scores, num_frames=self.num_frames)
+                else:
+                    idx_f = torch.randint(0, orig_seq_l, (self.num_frames,))
+                    idx_f = idx_f.sort().values
+
                 img_t = img_t[idx_f].contiguous()
 
-            if(self.df_train_ac_score is not None):
-                scores = torch.tensor(list(self.df_train_ac_score.query('file_path == @file_path').sort_values(by='frame_index')['score_pred']))
-
-                assert len(scores) == orig_seq_l
-
-                if(idx_f is not None):
+                if self.df_train_ac_score is not None:
                     scores = scores[idx_f]
-                ac_scores.append(scores)
+                    ac_scores.append(scores)
+            
 
             img_t = img_t.unsqueeze(0).repeat(3,1,1,1).contiguous()
 

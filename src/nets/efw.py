@@ -488,10 +488,12 @@ class EFWRopeEffnetV2s(LightningModule):
             nn.Dropout(self.hparams.dropout),
             nn.Linear(hidden, 1)
         )
-        self.proj = nn.Linear(self.hparams.embed_dim, self.hparams.num_classes)
-
-        if (hasattr(self.hparams, 'proj_bias') and self.hparams.proj_bias is not None):
-            self.proj.bias.data = torch.tensor(self.hparams.proj_bias)
+        self.proj = nn.Sequential(
+            nn.Linear(self.hparams.embed_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(self.hparams.dropout),
+            nn.Linear(hidden, self.hparams.num_classes)
+        )
 
         self.train_transform = v2.Compose(
             [
@@ -539,46 +541,69 @@ class EFWRopeEffnetV2s(LightningModule):
                                 weight_decay=self.hparams.weight_decay)
         return optimizer
     
-    def compute_loss(self, x_logits, Y, x_s_logit, Y_s, step="train", sync_dist=False):
-        # Y: grams (B,) -> normalize
+    def compute_loss(self, logits, Y, s_logit, Y_s, step="train", sync_dist=False):
+        # logits: (B,T,C)
+        # s_logit: (B,T,1)
+        B, T, C = logits.shape
+
+        # normalize target
         Y_g = Y.float().view(-1)
-        Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)  # (B,)
+        Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
 
-        # Ordinal EMD expects (B,N,C). Use N=1.
-        loss_emd = self.loss_fn(x_logits[:, None, :], y=Y_n[:, None])
+        # ---- Top-K pooling by learned gate logits ----
+        K = min(20, T)
+        s_logit_2d = s_logit.squeeze(-1)                 # (B,T)
+        top_s_logit, top_idx = s_logit_2d.topk(k=K, dim=1)  # (B,K)
 
-        # expected value in normalized space
-        p = torch.softmax(x_logits, dim=-1)  # (B,C)
-        bins = x_logits.new_tensor(self.hparams.bins)  # (C,) in [0,1]
-        y_hat = (p * bins).sum(dim=-1)  # (B,)
+        idx = top_idx[..., None].expand(B, K, C)         # (B,K,C)
+        top_logits = logits.gather(dim=1, index=idx)     # (B,K,C)
+
+        w = torch.softmax(top_s_logit, dim=1)            # (B,K)
+        study_logit = (w[..., None] * top_logits).sum(dim=1)  # (B,C)
+
+        # ---- Ordinal EMD ----
+        loss_emd = self.loss_fn(study_logit[:, None, :], y=Y_n[:, None])
+
+        # expected value
+        p = torch.softmax(study_logit, dim=-1)
+        bins = study_logit.new_tensor(self.hparams.bins)  # (C,) in [0,1]
+        y_hat = (p * bins).sum(dim=-1)
 
         loss_s = F.smooth_l1_loss(y_hat, Y_n)
 
-        # gate distillation (only confident AC frames)
-        # x_s_logit: (B,T,1) -> (B,T)
-        x_s_logit = x_s_logit.squeeze(-1)
+        # ---- Gate distillation (AC) on all frames ----
         Y_s = Y_s.float()
-
-        pos = Y_s > 0.6
+        pos = Y_s > 0.7
         neg = Y_s < 0.3
         mask = pos | neg
         y_gate = pos.float()
 
-        loss_g_all = F.binary_cross_entropy_with_logits(x_s_logit, y_gate, reduction="none")
-        loss_g = (loss_g_all * mask.float()).sum() / (mask.float().sum() + 1e-8) if mask.any() else loss_g_all.mean() * 0.0
+        loss_g_all = F.binary_cross_entropy_with_logits(s_logit_2d, y_gate, reduction="none")  # (B,T)
+        if mask.any():
+            loss_g = (loss_g_all * mask.float()).sum() / (mask.float().sum() + 1e-8)
+        else:
+            loss_g = loss_g_all.mean() * 0.0
 
-        s = torch.sigmoid(x_s_logit)      # (B,T)
+        # ---- Optional budget (can be lighter with Top-K pooling) ----
+        s = torch.sigmoid(s_logit_2d)
         target_mean = 0.2
-        loss_budget = ((s.mean(dim=1) - target_mean)**2).mean()
+        loss_budget = ((s.mean(dim=1) - target_mean) ** 2).mean()
 
         loss = loss_emd + 0.2 * loss_s + 0.1 * loss_g + 0.5 * loss_budget
 
-        # log interpretable metric in grams too
+        # metrics
         w_hat = 500.0 + 5000.0 * y_hat
         mae_g = torch.mean(torch.abs(w_hat - Y_g))
 
         self.log_dict(
-            {f"{step}_loss": loss, f"{step}_emd": loss_emd, f"{step}_s": loss_s, f"{step}_g": loss_g, f"{step}_mae_g": mae_g, f"{step}_budget": loss_budget},
+            {
+                f"{step}_loss": loss,
+                f"{step}_emd": loss_emd,
+                f"{step}_s": loss_s,
+                f"{step}_g": loss_g,
+                f"{step}_budget": loss_budget,
+                f"{step}_mae_g": mae_g,
+            },
             sync_dist=sync_dist,
             prog_bar=True,
         )
@@ -595,57 +620,126 @@ class EFWRopeEffnetV2s(LightningModule):
 
         Y_s = Y_s.reshape(B, N*T).contiguous()  # (B, N*T)
 
-        x_logits, x_s_logit = self(self.train_transform(X))
+        logits, s_logits = self(self.train_transform(X))
 
-        return self.compute_loss(x_logits=x_logits, Y=Y, x_s_logit=x_s_logit, Y_s=Y_s, step="train")
+        return self.compute_loss(logits=logits, Y=Y, s_logit=s_logits, Y_s=Y_s, step="train")
 
     def validation_step(self, val_batch, batch_idx):
-        X   = val_batch["img"]     # (B,C,T,H,W)
-        Y_g = val_batch["efw"].float().view(-1)
+        X   = val_batch["img"]  # (N,B,C,T,H,W)
+        Y_g = val_batch["efw"].float().view(-1)  # (B,)
 
-        Y = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
+        Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
 
-        X = X.permute(0, 1, 3, 2, 4, 5)  # B,N,C,T,H,W -> (B,N,T,C,H,W)
-        B, N, T, C, H, W = X.shape        
-        X = X.reshape(B, N*T, C, H, W).contiguous()  # (B, N*T,C,H,W)        
-        logits_study, s_logit = self(X)   # (B,C), (B,T,1)
+        logits_list = []
+        s_logits_list = []
 
-        bins = logits_study.new_tensor(self.hparams.bins)  # (C,)
+        # loop over sweeps N
+        for x in X:  # x: (B,C,T,H,W)
+            x = x.permute(0, 2, 1, 3, 4)   # (B,T,C,H,W)
+            logit_bt, s_logit_bt = self(x) # (B,T,C), (B,T,1)
+            logits_list.append(logit_bt)
+            s_logits_list.append(s_logit_bt)
 
-        p = torch.softmax(logits_study, dim=-1)
-        y_hat = (p * bins).sum(dim=-1)  # (B,)
+        logits = torch.cat(logits_list, dim=1)          # (B, M, C) where M=N*T
+        s_logits = torch.cat(s_logits_list, dim=1)      # (B, M, 1)
 
-        loss_s = F.smooth_l1_loss(y_hat, Y)
+        B, M, C = logits.shape
+
+        # ---- Top-K pooling by learned gate ----
+        K = min(20, M)
+        s = torch.sigmoid(s_logits).squeeze(-1)         # (B,M)
+
+        top_s, top_idx = s.topk(k=K, dim=1)             # (B,K)
+
+        idx = top_idx[..., None].expand(B, K, C)        # (B,K,C)
+        top_logits = logits.gather(dim=1, index=idx)    # (B,K,C)
+
+        # weights: better to softmax over gate *logits*; but keeping your version is OK
+        w = top_s / (top_s.sum(dim=1, keepdim=True) + 1e-8)  # (B,K)
+        study_logit = (w[..., None] * top_logits).sum(dim=1) # (B,C)
+
+        # ---- Expected value ----
+        p = torch.softmax(study_logit, dim=-1)
+        bins = study_logit.new_tensor(self.hparams.bins)      # (C,)
+        y_hat = (p * bins).sum(dim=-1)                        # (B,)
+
+        loss_s = F.smooth_l1_loss(y_hat, Y_n)
 
         w_hat = 500.0 + 5000.0 * y_hat
-        mae_g = torch.mean(torch.abs(w_hat - Y_g))
+        mae_g = (w_hat - Y_g).abs().mean()
+        bias_g = (w_hat - Y_g).mean()
 
-        self.log_dict({"val_loss": loss_s, "val_mae_g": mae_g}, prog_bar=True, sync_dist=True)
+        # ---- Optional: selection health metrics ----
+        eff_frames = (1.0 / (w.pow(2).sum(dim=1) + 1e-8)).mean()
 
+        self.log_dict(
+            {
+                "val_loss": loss_s,
+                "val_mae_g": mae_g,
+                "val_bias_g": bias_g,
+                "val_eff_frames": eff_frames,  # should be ~K-ish if top-k dominates
+            },
+            prog_bar=True,
+            sync_dist=True,
+        )
 
     def test_step(self, test_batch, batch_idx):
         
-        X   = test_batch["img"]     # (B,C,T,H,W)
-        Y_g = test_batch["efw"].float().view(-1)
+        X   = test_batch["img"]  # (N,B,C,T,H,W)
+        Y_g = test_batch["efw"].float().view(-1)  # (B,)
 
-        Y = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
-        
-        X = X.permute(0, 1, 3, 2, 4, 5)  # B,N,C,T,H,W -> (B,N,T,C,H,W)
-        B, N, T, C, H, W = X.shape        
-        X = X.reshape(B, N*T, C, H, W).contiguous()  # (B, N*T,C,H,W)        
-        logits_study, s_logit = self(X)   # (B,C), (B,T,1)
+        Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
 
-        bins = logits_study.new_tensor(self.hparams.bins)  # (C,)
+        logits_list = []
+        s_logits_list = []
 
-        p = torch.softmax(logits_study, dim=-1)
-        y_hat = (p * bins).sum(dim=-1)  # (B,)
+        # loop over sweeps N
+        for x in X:  # x: (B,C,T,H,W)
+            x = x.permute(0, 2, 1, 3, 4)   # (B,T,C,H,W)
+            logit_bt, s_logit_bt = self(x) # (B,T,C), (B,T,1)
+            logits_list.append(logit_bt)
+            s_logits_list.append(s_logit_bt)
 
-        loss_s = F.smooth_l1_loss(y_hat, Y)
+        logits = torch.cat(logits_list, dim=1)          # (B, M, C) where M=N*T
+        s_logits = torch.cat(s_logits_list, dim=1)      # (B, M, 1)
+
+        B, M, C = logits.shape
+
+        # ---- Top-K pooling by learned gate ----
+        K = min(20, M)
+        s = torch.sigmoid(s_logits).squeeze(-1)         # (B,M)
+
+        top_s, top_idx = s.topk(k=K, dim=1)             # (B,K)
+
+        idx = top_idx[..., None].expand(B, K, C)        # (B,K,C)
+        top_logits = logits.gather(dim=1, index=idx)    # (B,K,C)
+
+        # weights: better to softmax over gate *logits*; but keeping your version is OK
+        w = top_s / (top_s.sum(dim=1, keepdim=True) + 1e-8)  # (B,K)
+        study_logit = (w[..., None] * top_logits).sum(dim=1) # (B,C)
+
+        # ---- Expected value ----
+        p = torch.softmax(study_logit, dim=-1)
+        bins = study_logit.new_tensor(self.hparams.bins)      # (C,)
+        y_hat = (p * bins).sum(dim=-1)                        # (B,)
+
+        loss_s = F.smooth_l1_loss(y_hat, Y_n)
 
         w_hat = 500.0 + 5000.0 * y_hat
-        mae_g = torch.mean(torch.abs(w_hat - Y_g))
+        mae_g = (w_hat - Y_g).abs().mean()
+        bias_g = (w_hat - Y_g).mean()
 
-        self.log_dict({"test_loss": loss_s, "test_mae_g": mae_g}, prog_bar=True, sync_dist=True)
+        # ---- Optional: selection health metrics ----
+        eff_frames = (1.0 / (w.pow(2).sum(dim=1) + 1e-8)).mean()
+
+        self.log_dict(
+            {
+                "test_loss": loss_s,
+                "test_mae_g": mae_g,
+                "test_bias_g": bias_g,
+                "test_eff_frames": eff_frames,  # should be ~K-ish if top-k dominates
+            }
+        )
         
 
     def forward(self, x: torch.tensor):
@@ -655,14 +749,6 @@ class EFWRopeEffnetV2s(LightningModule):
         z = self.norm(z)
 
         s_logit = self.proj_s(z)
-        s = torch.sigmoid(s_logit)
+        logits = self.proj(z)        
 
-        logits = self.proj(z)
-
-        alpha = 0.8
-        w = alpha * s + (1 - alpha) / s.size(1)
-        w = w / (w.sum(dim=1, keepdim=True) + 1e-8)
-
-        logits = (w * logits).sum(dim=1)  # (B,C)
-
-        return logits, s_logit #[B, 1, C], [B, N, 1]
+        return logits, s_logit #[B, N, C], [B, N, 1]
