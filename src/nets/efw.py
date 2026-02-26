@@ -508,6 +508,10 @@ class EFWRopeEffnetV2s(LightningModule):
         bin_weights = self.hparams.bin_weights if hasattr(self.hparams, 'bin_weights') else None
         self.loss_fn = OrdinalEMDLoss(sigma=self.hparams.sigma, bins=self.hparams.bins, class_weights=self.hparams.class_weights, bin_weights=bin_weights)
 
+        self.scores = CatMetric()
+        self.preds = CatMetric()
+        self.targets = CatMetric()
+
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -682,6 +686,53 @@ class EFWRopeEffnetV2s(LightningModule):
             prog_bar=True,
             sync_dist=True,
         )
+
+
+        self.scores.update(top_s.mean())
+        self.preds.update(w_hat)
+        self.targets.update(Y_g)
+
+    def on_validation_epoch_end(self):
+        scores  = self.scores.compute().detach().flatten()
+        preds   = self.preds.compute().detach().flatten()
+        targets = self.targets.compute().detach().flatten()
+
+        if scores.numel() == 0:
+            self.scores.reset(); self.preds.reset(); self.targets.reset()
+            return
+
+        err = (preds - targets).abs()
+
+        self.log("val_mae_g_all", err.mean(), prog_bar=True, sync_dist=True)
+        self.log("val_bias_g_all", (preds - targets).mean(), prog_bar=False, sync_dist=True)
+
+        for r in [0.05, 0.10, 0.15]:
+            thr = torch.quantile(scores, r)
+            accept = scores >= thr
+            rej = ~accept
+
+            mae_acc  = err[accept].mean() if accept.any() else err.mean()
+            bias_acc = (preds[accept] - targets[accept]).mean() if accept.any() else (preds - targets).mean()
+            cov_acc  = accept.float().mean()
+
+            mae_rej = err[rej].mean() if rej.any() else err.mean() * 0.0
+
+            tag = int(r * 100)
+            self.log(f"val_mae_g_r{tag:02d}", mae_acc, prog_bar=(r == 0.15), sync_dist=True)
+            self.log(f"val_cov_r{tag:02d}", cov_acc, prog_bar=False, sync_dist=True)
+            self.log(f"val_bias_g_r{tag:02d}", bias_acc, prog_bar=False, sync_dist=True)
+            self.log(f"val_thr_r{tag:02d}", thr, prog_bar=False, sync_dist=True)
+            self.log(f"val_mae_g_rej{tag:02d}", mae_rej, prog_bar=False, sync_dist=True)
+
+        self.log("val_score_mean", scores.mean(), prog_bar=False, sync_dist=True)
+        self.log("val_score_p10", torch.quantile(scores, 0.10), prog_bar=False, sync_dist=True)
+        self.log("val_score_p50", torch.quantile(scores, 0.50), prog_bar=False, sync_dist=True)
+        self.log("val_score_p90", torch.quantile(scores, 0.90), prog_bar=False, sync_dist=True)
+
+        self.scores.reset()
+        self.preds.reset()
+        self.targets.reset()
+        
 
     def test_step(self, test_batch, batch_idx):
         
