@@ -687,15 +687,19 @@ class EFWRopeEffnetV2s(LightningModule):
             sync_dist=True,
         )
 
+        entropy = -(p * (p + 1e-8).log()).sum(dim=-1)
+        entropy_norm = entropy / math.log(p.size(-1))
+        conf = 1.0 - entropy_norm
 
-        self.scores.update(top_s.mean())
+        self.scores.update(conf.detach())
+
         self.preds.update(w_hat)
         self.targets.update(Y_g)
 
     def on_validation_epoch_end(self):
-        scores  = self.scores.compute().detach().flatten()
-        preds   = self.preds.compute().detach().flatten()
-        targets = self.targets.compute().detach().flatten()
+        scores  = self.scores.compute().flatten()
+        preds   = self.preds.compute().flatten()
+        targets = self.targets.compute().flatten()
 
         if scores.numel() == 0:
             self.scores.reset(); self.preds.reset(); self.targets.reset()
