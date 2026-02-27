@@ -618,13 +618,18 @@ class EFWRopeEffnetV2s(LightningModule):
         Y_s = train_batch["ac_scores"]
         Y = train_batch["efw"]
 
-        X = X.permute(0, 1, 3, 2, 4, 5)  # B,N,C,T,H,W -> (B,N,T,C,H,W)
-        B, N, T, C, H, W = X.shape        
-        X = X.reshape(B, N*T, C, H, W).contiguous()  # (B, N*T,C,H,W)
+        logits = []
+        s_logits = []
 
-        Y_s = Y_s.reshape(B, N*T).contiguous()  # (B, N*T)
+        # loop over sweeps N
+        for x in X:  # x: (B,C,T,H,W)
+            x = x.permute(0, 2, 1, 3, 4)   # (B,T,C,H,W)
+            l, s = self(self.train_transform(x)) # (B,T,C), (B,T,1)
+            logits.append(l)
+            s_logits.append(s)
 
-        logits, s_logits = self(self.train_transform(X))
+        logits = torch.cat(logits, dim=1)          # (B, M, C) where M=N*T
+        s_logits = torch.cat(s_logits, dim=1)     # (B, M, 1)
 
         return self.compute_loss(logits=logits, Y=Y, s_logit=s_logits, Y_s=Y_s, step="train")
 
@@ -634,18 +639,18 @@ class EFWRopeEffnetV2s(LightningModule):
 
         Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
 
-        logits_list = []
-        s_logits_list = []
+        logits = []
+        s_logits = []
 
         # loop over sweeps N
         for x in X:  # x: (B,C,T,H,W)
             x = x.permute(0, 2, 1, 3, 4)   # (B,T,C,H,W)
-            logit_bt, s_logit_bt = self(x) # (B,T,C), (B,T,1)
-            logits_list.append(logit_bt)
-            s_logits_list.append(s_logit_bt)
-
-        logits = torch.cat(logits_list, dim=1)          # (B, M, C) where M=N*T
-        s_logits = torch.cat(s_logits_list, dim=1)      # (B, M, 1)
+            l, s = self(x) # (B,T,C), (B,T,1)
+            logits.append(l)
+            s_logits.append(s)
+    
+        logits = torch.cat(logits, dim=1)          # (B, M, C) where M=N*T
+        s_logits = torch.cat(s_logits, dim=1)      # (B, M, 1)
 
         B, M, C = logits.shape
 
