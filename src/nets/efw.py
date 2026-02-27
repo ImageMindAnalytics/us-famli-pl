@@ -563,7 +563,7 @@ class EFWRopeEffnetV2s(LightningModule):
         Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
 
         # ---- Top-K pooling by learned gate logits ----
-        K = min(20, T)
+        K = min(20, T*N)
         s_logit_2d = s_logit.squeeze(-1)                 # (B,N*T)
         top_s_logit, top_idx = s_logit_2d.topk(k=K, dim=1)  # (B,K)
 
@@ -656,10 +656,9 @@ class EFWRopeEffnetV2s(LightningModule):
         B, M, C = logits.shape
 
         # ---- Top-K pooling by learned gate ----
-        K = min(20, M)
-        s = torch.sigmoid(s_logits).squeeze(-1)         # (B,M)
+        K = min(20, M)        
 
-        top_s, top_idx = s.topk(k=K, dim=1)             # (B,K)
+        top_s, top_idx = s_logits.squeeze(-1).topk(k=K, dim=1)             # (B,K)
 
         idx = top_idx[..., None].expand(B, K, C)        # (B,K,C)
         top_logits = logits.gather(dim=1, index=idx)    # (B,K,C)
@@ -766,24 +765,23 @@ class EFWRopeEffnetV2s(LightningModule):
         
 
     def test_step(self, test_batch, batch_idx):
-        
         X   = test_batch["img"]  # (N,B,C,T,H,W)
         Y_g = test_batch["efw"].float().view(-1)  # (B,)
 
         Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
 
-        logits_list = []
-        s_logits_list = []
+        logits = []
+        s_logits = []
 
         # loop over sweeps N
         for x in X:  # x: (B,C,T,H,W)
             x = x.permute(0, 2, 1, 3, 4)   # (B,T,C,H,W)
-            logit_bt, s_logit_bt = self(x) # (B,T,C), (B,T,1)
-            logits_list.append(logit_bt)
-            s_logits_list.append(s_logit_bt)
-
-        logits = torch.cat(logits_list, dim=1)          # (B, M, C) where M=N*T
-        s_logits = torch.cat(s_logits_list, dim=1)      # (B, M, 1)
+            l, s = self(x) # (B,T,C), (B,T,1)
+            logits.append(l)
+            s_logits.append(s)
+    
+        logits = torch.cat(logits, dim=1)          # (B, M, C) where M=N*T
+        s_logits = torch.cat(s_logits, dim=1)      # (B, M, 1)
 
         B, M, C = logits.shape
 
@@ -795,9 +793,8 @@ class EFWRopeEffnetV2s(LightningModule):
 
         idx = top_idx[..., None].expand(B, K, C)        # (B,K,C)
         top_logits = logits.gather(dim=1, index=idx)    # (B,K,C)
-
-        # weights: better to softmax over gate *logits*; but keeping your version is OK
-        w = top_s / (top_s.sum(dim=1, keepdim=True) + 1e-8)  # (B,K)
+        
+        w = torch.softmax(top_s, dim=1)            # (B,K)
         study_logit = (w[..., None] * top_logits).sum(dim=1) # (B,C)
 
         # ---- Expected value ----
@@ -808,8 +805,6 @@ class EFWRopeEffnetV2s(LightningModule):
         loss_s = F.smooth_l1_loss(y_hat, Y_n)
 
         w_hat = 500.0 + 5000.0 * y_hat
-        mae_g = (w_hat - Y_g).abs().mean()
-        bias_g = (w_hat - Y_g).mean()
 
         # ---- Optional: selection health metrics ----
         eff_frames = (1.0 / (w.pow(2).sum(dim=1) + 1e-8)).mean()
@@ -817,10 +812,10 @@ class EFWRopeEffnetV2s(LightningModule):
         self.log_dict(
             {
                 "test_loss": loss_s,
-                "test_mae_g": mae_g,
-                "test_bias_g": bias_g,
                 "test_eff_frames": eff_frames,  # should be ~K-ish if top-k dominates
-            }
+            },
+            prog_bar=True,
+            sync_dist=True,
         )
         
 
