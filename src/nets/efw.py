@@ -562,50 +562,47 @@ class EFWRopeEffnetV2s(LightningModule):
         Y_g = Y.float().view(-1)
         Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
 
-        # ---- Top-K pooling by learned gate logits ----
-        K = min(20, T*N)
-        s_logit_2d = s_logit.squeeze(-1)                 # (B,N*T)
-        top_s_logit, top_idx = s_logit_2d.topk(k=K, dim=1)  # (B,K)
+        K = min(20, N*T)
+        s2 = s_logit.squeeze(-1)                 # (B,M)
+        top_s2, top_idx = s2.topk(k=K, dim=1)
 
-        idx = top_idx[..., None].expand(B, K, C)         # (B,K,C)
-        top_logits = logits.gather(dim=1, index=idx)     # (B,K,C)
+        idx = top_idx[..., None].expand(B, K, C)
+        top_logits = logits.gather(dim=1, index=idx)
 
-        w = torch.softmax(top_s_logit, dim=1)            # (B,K)
-        study_logit = (w[..., None] * top_logits).sum(dim=1)  # (B,C)
+        w = torch.softmax(top_s2, dim=1)
+        study_logit = (w[..., None] * top_logits).sum(dim=1)
 
-        # ---- Ordinal EMD ----
         loss_emd = self.loss_fn(study_logit[:, None, :], y=Y_n[:, None])
 
-        # expected value
         p = torch.softmax(study_logit, dim=-1)
-        bins = study_logit.new_tensor(self.hparams.bins)  # (C,) in [0,1]
+        bins = study_logit.new_tensor(self.hparams.bins)
         y_hat = (p * bins).sum(dim=-1)
-
         loss_s = F.smooth_l1_loss(y_hat, Y_n)
 
-        # ---- Gate distillation (AC) on all frames ----
+        # gate distill
         Y_s = Y_s.float()
         pos = Y_s > 0.7
         neg = Y_s < 0.3
-        mask = pos | neg
+        mask = (pos | neg)
         y_gate = pos.float()
 
-        loss_g_all = F.binary_cross_entropy_with_logits(s_logit_2d, y_gate, reduction="none")  # (B,T)
-        if mask.any():
-            loss_g = (loss_g_all * mask.float()).sum() / (mask.float().sum() + 1e-8)
-        else:
-            loss_g = loss_g_all.mean() * 0.0
+        loss_g_all = F.binary_cross_entropy_with_logits(s2, y_gate, reduction="none")  # (B,M)
+        mask_f = mask.float()
+        den = mask_f.sum(dim=1).clamp_min(1.0)
+        loss_g = ((loss_g_all * mask_f).sum(dim=1) / den).mean()
 
-        # ---- Optional budget (can be lighter with Top-K pooling) ----
-        s = torch.sigmoid(s_logit_2d)
-        target_mean = 0.2
-        loss_budget = ((s.mean(dim=1) - target_mean) ** 2).mean()
+        # entropy stabilizer (tiny)
+        ent_w = -(w * (w + 1e-8).log()).sum(dim=1).mean()
+        loss_ent = -ent_w
 
-        loss = loss_emd + 0.2 * loss_s + 0.1 * loss_g + 0.5 * loss_budget
+        loss = loss_emd + 0.2*loss_s + 0.1*loss_g + 1e-3*loss_ent
 
         # metrics
         w_hat = 500.0 + 5000.0 * y_hat
         mae_g = torch.mean(torch.abs(w_hat - Y_g))
+
+        w_max = w.max(dim=1).values.item()               # scalar
+        eff_frames = (1.0 / (w.pow(2).sum(dim=1) + 1e-8)).item()
 
         self.log_dict(
             {
@@ -613,8 +610,12 @@ class EFWRopeEffnetV2s(LightningModule):
                 f"{step}_emd": loss_emd,
                 f"{step}_s": loss_s,
                 f"{step}_g": loss_g,
-                f"{step}_budget": loss_budget,
+                f"{step}_ent_w": ent_w,
                 f"{step}_mae_g": mae_g,
+                f"{step}_w_max": w_max,
+                f"{step}_eff_frames": eff_frames,
+                f"{step}_top_s_mean": top_s2.mean(),
+                
             },
             sync_dist=sync_dist,
             prog_bar=True,
