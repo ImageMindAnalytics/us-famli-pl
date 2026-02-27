@@ -32,6 +32,10 @@ import torchmetrics
 
 import os
 
+from pathlib import Path
+import csv
+
+
 def gaussian_nll(y, mu, log_var, reduction="mean"):
     """
     Gaussian Negative Log-Likelihood for heteroscedastic regression.
@@ -546,9 +550,13 @@ class EFWRopeEffnetV2s(LightningModule):
         return optimizer
     
     def compute_loss(self, logits, Y, s_logit, Y_s, step="train", sync_dist=False):
-        # logits: (B,T,C)
-        # s_logit: (B,T,1)
-        B, T, C = logits.shape
+        # logits: (B,N, T,C)
+        # s_logit: (B,N,T,1)
+        B, N, T, C = logits.shape
+
+        logits = logits.view(B, N*T, C)        # (B, N*T, C)
+        s_logit = s_logit.view(B, N*T, 1)     # (B, N*T, 1)
+        Y_s = Y_s.view(B, N*T)              # (B, N*T)
 
         # normalize target
         Y_g = Y.float().view(-1)
@@ -556,7 +564,7 @@ class EFWRopeEffnetV2s(LightningModule):
 
         # ---- Top-K pooling by learned gate logits ----
         K = min(20, T)
-        s_logit_2d = s_logit.squeeze(-1)                 # (B,T)
+        s_logit_2d = s_logit.squeeze(-1)                 # (B,N*T)
         top_s_logit, top_idx = s_logit_2d.topk(k=K, dim=1)  # (B,K)
 
         idx = top_idx[..., None].expand(B, K, C)         # (B,K,C)
@@ -617,19 +625,12 @@ class EFWRopeEffnetV2s(LightningModule):
         X = train_batch["img"]
         Y_s = train_batch["ac_scores"]
         Y = train_batch["efw"]
+        
+        x = X.squeeze(0).permute(0, 2, 1, 3, 4) # (N,T,C,H,W)
+        logits, s_logits = self(self.train_transform(x))
 
-        logits = []
-        s_logits = []
-
-        # loop over sweeps N
-        for x in X:  # x: (B,C,T,H,W)
-            x = x.permute(0, 2, 1, 3, 4)   # (B,T,C,H,W)
-            l, s = self(self.train_transform(x)) # (B,T,C), (B,T,1)
-            logits.append(l)
-            s_logits.append(s)
-
-        logits = torch.cat(logits, dim=1)          # (B, M, C) where M=N*T
-        s_logits = torch.cat(s_logits, dim=1)     # (B, M, 1)
+        logits = logits.unsqueeze(0)    
+        s_logits = s_logits.unsqueeze(0)
 
         return self.compute_loss(logits=logits, Y=Y, s_logit=s_logits, Y_s=Y_s, step="train")
 
@@ -697,41 +698,67 @@ class EFWRopeEffnetV2s(LightningModule):
         self.targets.update(Y_g)
 
     def on_validation_epoch_end(self):
-        scores  = self.scores.compute().flatten()
-        preds   = self.preds.compute().flatten()
-        targets = self.targets.compute().flatten()
+        scores  = self.scores.compute().detach().flatten()
+        preds   = self.preds.compute().detach().flatten()
+        targets = self.targets.compute().detach().flatten()
 
         if scores.numel() == 0:
             self.scores.reset(); self.preds.reset(); self.targets.reset()
             return
 
         err = (preds - targets).abs()
+        bias = (preds - targets)
 
-        self.log("val_mae_g_all", err.mean(), prog_bar=True)
-        self.log("val_bias_g_all", (preds - targets).mean(), prog_bar=True)
+        # --- base metrics ---
+        metrics = {}
+        metrics["epoch"] = int(self.current_epoch)
+        metrics["val_mae_g_all"]  = float(err.mean().item())
+        metrics["val_bias_g_all"] = float(bias.mean().item())
 
+        # --- reject budgets ---
         for r in [0.05, 0.10, 0.15]:
             thr = torch.quantile(scores, r)
             accept = scores >= thr
             rej = ~accept
 
             mae_acc  = err[accept].mean() if accept.any() else err.mean()
-            bias_acc = (preds[accept] - targets[accept]).mean() if accept.any() else (preds - targets).mean()
+            bias_acc = bias[accept].mean() if accept.any() else bias.mean()
             cov_acc  = accept.float().mean()
-
-            mae_rej = err[rej].mean() if rej.any() else err.mean() * 0.0
+            mae_rej  = err[rej].mean() if rej.any() else err.mean() * 0.0
 
             tag = int(r * 100)
-            self.log(f"val_mae_g_r{tag:02d}", mae_acc, prog_bar=(r == 0.15))
-            self.log(f"val_cov_r{tag:02d}", cov_acc, prog_bar=False)
-            self.log(f"val_bias_g_r{tag:02d}", bias_acc, prog_bar=False)
-            self.log(f"val_thr_r{tag:02d}", thr, prog_bar=False)
-            self.log(f"val_mae_g_rej{tag:02d}", mae_rej, prog_bar=False)
+            metrics[f"val_mae_g_r{tag:02d}"]     = float(mae_acc.item())
+            metrics[f"val_cov_r{tag:02d}"]       = float(cov_acc.item())
+            metrics[f"val_bias_g_r{tag:02d}"]    = float(bias_acc.item())
+            metrics[f"val_thr_r{tag:02d}"]       = float(thr.item())
+            metrics[f"val_mae_g_rej{tag:02d}"]   = float(mae_rej.item())
 
-        self.log("val_score_mean", scores.mean(), prog_bar=False)
-        self.log("val_score_p10", torch.quantile(scores, 0.10), prog_bar=False)
-        self.log("val_score_p50", torch.quantile(scores, 0.50), prog_bar=False)
-        self.log("val_score_p90", torch.quantile(scores, 0.90), prog_bar=False)
+            # still log to progress bar if you want
+            self.log(f"val_mae_g_r{tag:02d}", mae_acc, prog_bar=(r == 0.15), sync_dist=True)
+            self.log(f"val_cov_r{tag:02d}", cov_acc, prog_bar=False, sync_dist=True)
+
+        # --- score distribution ---
+        metrics["val_score_mean"] = float(scores.mean().item())
+        metrics["val_score_p10"]  = float(torch.quantile(scores, 0.10).item())
+        metrics["val_score_p50"]  = float(torch.quantile(scores, 0.50).item())
+        metrics["val_score_p90"]  = float(torch.quantile(scores, 0.90).item())
+
+        # log key ones
+        self.log("val_mae_g_all", err.mean(), prog_bar=True, sync_dist=True)
+        self.log("val_bias_g_all", bias.mean(), prog_bar=True, sync_dist=True)
+
+        # --- append to CSV (rank 0 only) ---
+        if self.trainer.is_global_zero:
+            out_dir = Path(self.hparams.out)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = out_dir / "val_metrics.csv"
+
+            write_header = not csv_path.exists()
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(metrics)
 
         self.scores.reset()
         self.preds.reset()
