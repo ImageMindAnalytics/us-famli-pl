@@ -562,7 +562,7 @@ class EFWRopeEffnetV2s(LightningModule):
         Y_g = Y.float().view(-1)
         Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
 
-        K = min(5, N*T)
+        K = min(self.hparams.top_k, N*T)
         s2 = s_logit.squeeze(-1)                 # (B,M)
         top_s2, top_idx = s2.topk(k=K, dim=1)
 
@@ -606,8 +606,10 @@ class EFWRopeEffnetV2s(LightningModule):
         w_max = w.max(dim=1).values.item()               # scalar
         eff_frames = (1.0 / (w.pow(2).sum(dim=1) + 1e-8)).item()
 
-        self.log_dict(
-            {
+        entropy = -(p * (p + 1e-8).log()).sum(dim=-1) 
+        entropy_norm = entropy / math.log(p.size(-1))             
+
+        loss_d = {
                 f"{step}_loss": loss,
                 f"{step}_emd": loss_emd,
                 f"{step}_s": loss_s,
@@ -617,12 +619,23 @@ class EFWRopeEffnetV2s(LightningModule):
                 f"{step}_w_max": w_max,
                 f"{step}_eff_frames": eff_frames,
                 f"{step}_top_s_mean": top_s2.mean(),
-                
-            },
+                f"{step}_entropy_norm": entropy_norm,
+            }
+
+        self.log_dict(
+            loss_d,
             sync_dist=sync_dist,
-            prog_bar=True,
+            prog_bar=step == "val",
         )
-        return loss
+
+        if step == "val":            
+            conf = 1.0 - entropy_norm
+
+            self.scores.update(conf)
+            self.preds.update(w_hat)
+            self.targets.update(Y_g)
+
+        return loss_d
 
     def training_step(self, train_batch, batch_idx):
         X = train_batch["img"]
@@ -641,8 +654,6 @@ class EFWRopeEffnetV2s(LightningModule):
         X   = val_batch["img"]  # (N,B,C,T,H,W)
         Y_g = val_batch["efw"].float().view(-1)  # (B,)
 
-        Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
-
         logits = []
         s_logits = []
 
@@ -656,48 +667,7 @@ class EFWRopeEffnetV2s(LightningModule):
         logits = torch.cat(logits, dim=1)          # (B, M, C) where M=N*T
         s_logits = torch.cat(s_logits, dim=1)      # (B, M, 1)
 
-        B, M, C = logits.shape
-
-        # ---- Top-K pooling by learned gate ----
-        K = min(20, M)        
-
-        top_s, top_idx = s_logits.squeeze(-1).topk(k=K, dim=1)             # (B,K)
-
-        idx = top_idx[..., None].expand(B, K, C)        # (B,K,C)
-        top_logits = logits.gather(dim=1, index=idx)    # (B,K,C)
-        
-        w = torch.softmax(top_s, dim=1)            # (B,K)
-        study_logit = (w[..., None] * top_logits).sum(dim=1) # (B,C)
-
-        # ---- Expected value ----
-        p = torch.softmax(study_logit, dim=-1)
-        bins = study_logit.new_tensor(self.hparams.bins)      # (C,)
-        y_hat = (p * bins).sum(dim=-1)                        # (B,)
-
-        loss_s = F.smooth_l1_loss(y_hat, Y_n)
-
-        w_hat = 500.0 + 5000.0 * y_hat
-
-        # ---- Optional: selection health metrics ----
-        eff_frames = (1.0 / (w.pow(2).sum(dim=1) + 1e-8)).mean()
-
-        self.log_dict(
-            {
-                "val_loss": loss_s,
-                "val_eff_frames": eff_frames,  # should be ~K-ish if top-k dominates
-            },
-            prog_bar=True,
-            sync_dist=True,
-        )
-
-        entropy = -(p * (p + 1e-8).log()).sum(dim=-1)
-        entropy_norm = entropy / math.log(p.size(-1))
-        conf = 1.0 - entropy_norm
-
-        self.scores.update(conf.detach())
-
-        self.preds.update(w_hat)
-        self.targets.update(Y_g)
+        self.compute_loss(logits=logits, Y=Y_g, s_logit=s_logits, Y_s=None, step="val")
 
     def on_validation_epoch_end(self):
         scores  = self.scores.compute().detach().flatten()
@@ -786,40 +756,7 @@ class EFWRopeEffnetV2s(LightningModule):
         logits = torch.cat(logits, dim=1)          # (B, M, C) where M=N*T
         s_logits = torch.cat(s_logits, dim=1)      # (B, M, 1)
 
-        B, M, C = logits.shape
-
-        # ---- Top-K pooling by learned gate ----
-        K = min(20, M)
-        s = torch.sigmoid(s_logits).squeeze(-1)         # (B,M)
-
-        top_s, top_idx = s.topk(k=K, dim=1)             # (B,K)
-
-        idx = top_idx[..., None].expand(B, K, C)        # (B,K,C)
-        top_logits = logits.gather(dim=1, index=idx)    # (B,K,C)
-        
-        w = torch.softmax(top_s, dim=1)            # (B,K)
-        study_logit = (w[..., None] * top_logits).sum(dim=1) # (B,C)
-
-        # ---- Expected value ----
-        p = torch.softmax(study_logit, dim=-1)
-        bins = study_logit.new_tensor(self.hparams.bins)      # (C,)
-        y_hat = (p * bins).sum(dim=-1)                        # (B,)
-
-        loss_s = F.smooth_l1_loss(y_hat, Y_n)
-
-        w_hat = 500.0 + 5000.0 * y_hat
-
-        # ---- Optional: selection health metrics ----
-        eff_frames = (1.0 / (w.pow(2).sum(dim=1) + 1e-8)).mean()
-
-        self.log_dict(
-            {
-                "test_loss": loss_s,
-                "test_eff_frames": eff_frames,  # should be ~K-ish if top-k dominates
-            },
-            prog_bar=True,
-            sync_dist=True,
-        )
+        self.compute_loss(logits=logits, Y=Y_g, s_logit=s_logits, Y_s=None, step="test", sync_dist=True)
         
 
     def forward(self, x: torch.tensor):
