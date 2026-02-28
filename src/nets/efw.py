@@ -562,7 +562,7 @@ class EFWRopeEffnetV2s(LightningModule):
         Y_g = Y.float().view(-1)
         Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
 
-        K = min(20, N*T)
+        K = min(5, N*T)
         s2 = s_logit.squeeze(-1)                 # (B,M)
         top_s2, top_idx = s2.topk(k=K, dim=1)
 
@@ -593,7 +593,9 @@ class EFWRopeEffnetV2s(LightningModule):
 
         # entropy stabilizer (tiny)
         ent_w = -(w * (w + 1e-8).log()).sum(dim=1).mean()
-        loss_ent = -ent_w
+        # encourage ent_w >= 0.6*log(K), but don’t push to uniform
+        ent_floor = 0.6 * math.log(K)
+        loss_ent = F.relu(ent_floor - ent_w)
 
         loss = loss_emd + 0.2*loss_s + 0.1*loss_g + 1e-3*loss_ent
 
