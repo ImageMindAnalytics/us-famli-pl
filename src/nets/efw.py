@@ -531,6 +531,7 @@ class EFWRopeEffnetV2s(LightningModule):
         group.add_argument("--bin_weights", type=float, nargs="+", default=None, help='Bin weights for Ordinal EMD Loss')       
 
         group.add_argument("--num_classes", type=int, default=9, help='Output channels for projection head')
+        group.add_argument("--top_k", type=int, default=5, help='Top K elements for selection based on scores for loss computation')
         
         # Image Encoder parameters         
         group.add_argument("--in_channels", type=int, default=3, help='Input channels for encoder')
@@ -549,20 +550,17 @@ class EFWRopeEffnetV2s(LightningModule):
                                 weight_decay=self.hparams.weight_decay)
         return optimizer
     
-    def compute_loss(self, logits, Y, s_logit, Y_s, step="train", sync_dist=False):
+    def compute_loss(self, logits, Y, s_logit, Y_s=None, step="train", sync_dist=False):
         # logits: (B,N, T,C)
         # s_logit: (B,N,T,1)
-        B, N, T, C = logits.shape
-
-        logits = logits.view(B, N*T, C)        # (B, N*T, C)
-        s_logit = s_logit.view(B, N*T, 1)     # (B, N*T, 1)
-        Y_s = Y_s.view(B, N*T)              # (B, N*T)
+        
+        B, T, C = logits.shape
 
         # normalize target
         Y_g = Y.float().view(-1)
         Y_n = ((Y_g - 500.0) / 5000.0).clamp(0.0, 1.0)
 
-        K = min(self.hparams.top_k, N*T)
+        K = min(self.hparams.top_k, T)
         s2 = s_logit.squeeze(-1)                 # (B,M)
         top_s2, top_idx = s2.topk(k=K, dim=1)
 
@@ -577,25 +575,27 @@ class EFWRopeEffnetV2s(LightningModule):
         p = torch.softmax(study_logit, dim=-1)
         bins = study_logit.new_tensor(self.hparams.bins)
         y_hat = (p * bins).sum(dim=-1)
-        loss_s = F.smooth_l1_loss(y_hat, Y_n)
-
-        # gate distill
-        Y_s = Y_s.float()
-        pos = Y_s > 0.7
-        neg = Y_s < 0.3
-        mask = (pos | neg)
-        y_gate = pos.float()
-
-        loss_g_all = F.binary_cross_entropy_with_logits(s2, y_gate, reduction="none")  # (B,M)
-        mask_f = mask.float()
-        den = mask_f.sum(dim=1).clamp_min(1.0)
-        loss_g = ((loss_g_all * mask_f).sum(dim=1) / den).mean()
+        loss_s = F.smooth_l1_loss(y_hat, Y_n)        
 
         # entropy stabilizer (tiny)
         ent_w = -(w * (w + 1e-8).log()).sum(dim=1).mean()
         # encourage ent_w >= 0.6*log(K), but don’t push to uniform
         ent_floor = 0.6 * math.log(K)
         loss_ent = F.relu(ent_floor - ent_w)
+
+        # gate distill
+        loss_g = 0.0
+        if Y_s is not None:
+            Y_s = Y_s.float()
+            pos = Y_s > 0.7
+            neg = Y_s < 0.3
+            mask = (pos | neg)
+            y_gate = pos.float()
+
+            loss_g_all = F.binary_cross_entropy_with_logits(s2, y_gate, reduction="none")  # (B,M)
+            mask_f = mask.float()
+            den = mask_f.sum(dim=1).clamp_min(1.0)
+            loss_g = ((loss_g_all * mask_f).sum(dim=1) / den).mean()
 
         loss = loss_emd + 0.2*loss_s + 0.1*loss_g + 1e-3*loss_ent
 
@@ -648,7 +648,15 @@ class EFWRopeEffnetV2s(LightningModule):
         logits = logits.unsqueeze(0)    
         s_logits = s_logits.unsqueeze(0)
 
-        return self.compute_loss(logits=logits, Y=Y, s_logit=s_logits, Y_s=Y_s, step="train")
+        B, N, T, C = logits.shape
+
+        logits = logits.view(B, N*T, C)        # (B, N*T, C)
+        s_logits = s_logits.view(B, N*T, 1)     # (B, N*T, 1)
+        Y_s = Y_s.view(B, N*T)              # (B, N*T)
+
+        loss_d = self.compute_loss(logits=logits, Y=Y, s_logit=s_logits, Y_s=Y_s, step="train")
+
+        return loss_d["train_loss"]
 
     def validation_step(self, val_batch, batch_idx):
         X   = val_batch["img"]  # (N,B,C,T,H,W)
